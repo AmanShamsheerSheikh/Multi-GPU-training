@@ -83,11 +83,6 @@ class ResNet18(nn.Module):
 
       return x
 
-model = ResNet18(num_classes=1000)
-x = torch.randn(1, 3, 224, 224)
-y = model(x)
-print(y.shape)
-
 """DDP Code"""
 
 def setup_ddp():
@@ -109,13 +104,18 @@ def get_device():
 
 def get_dataloader(batch_size):
   from torchvision.datasets import CIFAR10
-  from torchvision.transforms import ToTensor
+  from torchvision import transforms
+
+  dataset_transforms = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor()
+  ])
 
   dataset = CIFAR10(
     root="./data",
     train=True,
     download=True,
-    transform=ToTensor()
+    transform=dataset_transforms,
   )
 
   sampler = DistributedSampler(dataset)
@@ -202,28 +202,39 @@ def train(model, dataloader, sampler, device):
         torch.cuda.synchronize()
         time_per_step.append(starter.elapsed_time(ender))
 
+      with torch.no_grad():
+        reduced_loss = loss.detach()
+        dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
+        reduced_loss /= dist.get_world_size()
       if rank == 0:
-        with torch.no_grad():
-          reduced_loss = loss.detach()
-          dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
-          reduced_loss /= dist.get_world_size()
           loss_per_step.append(reduced_loss.item())
       i += 1
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
       time_per_epoch.append(time.time() - epoch_start)
-      gpu_utilizations.append(get_gpu_util(rank))
+      utils = [get_gpu_util(i) for i in range(torch.cuda.device_count())]
+      gpu_utilizations.append(utils)
   if rank == 0:
     return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
   else:
     return None, None, None, None
 
+def create_n_arrray(gpu_utils):
+  per_gpu_util = []
+  temp_arr= []
+  for i in range(len(gpu_utils[0])):
+    temp_arr = []
+    for j in range(len(gpu_utils)):
+      temp_arr.append(gpu_utils[j][i])
+    per_gpu_util.append(temp_arr)
+  return per_gpu_util
 
 def main():
   setup_ddp()
-  pynvml.nvmlInit()
+  if dist.get_rank() == 0:
+    pynvml.nvmlInit()
   device = get_device()
-  batch_size=64
+  batch_size=256
   dataloader, sampler = get_dataloader(batch_size)
   model = get_model(device)
 
@@ -234,10 +245,13 @@ def main():
     plot_graph(value=loss_per_step, title='Training Loss Over Steps', xlabel='Step (Index)', ylabel='Loss')
     plot_graph(value=time_per_epoch, title="Time per Epoch", xlabel='Epoch', ylabel='Time (s)')
     plot_graph(value=time_per_step, title="Time per Step", xlabel='Step', ylabel='Time (ms)')
-    plot_graph(value=gpu_utilizations, title="GPU Utilizations", xlabel="Epoch", ylabel='GPU Utilization (%)')
-    avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000
+    per_gpu_utils = create_n_arrray(gpu_utilizations)
+    for i,gpu_util in enumerate(per_gpu_utils):
+      plot_graph(value=gpu_util, title="GPU Utilizations " + str(i), xlabel="Epoch", ylabel='GPU Utilization (%)')
+    avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
     global_batch_size = batch_size * dist.get_world_size()
     throughput = global_batch_size / avg_step_time_s
     print("throughput: ", throughput)
     print("Total time taken: ", total_time_taken)
+  torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{dist.get_world_size()}.pt')
   dist.destroy_process_group()
