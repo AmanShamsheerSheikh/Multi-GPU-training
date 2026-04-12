@@ -136,12 +136,14 @@ def get_model(device):
   model = DDP(model, device_ids=[device.index])
   return model
 
-def plot_graph(value, title, xlabel, ylabel):
+def plot_graph(value, title, xlabel, ylabel, filename):
+  plt.figure()
   plt.plot(value)
   plt.title(title)
   plt.xlabel(xlabel)
   plt.ylabel(ylabel)
-  plt.show()
+  plt.savefig(filename)
+  plt.close()
 
 def check_gradients(model):
   with torch.no_grad():
@@ -242,12 +244,12 @@ def main():
   loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, device)
   total_time_taken = time.time() - training_start_time
   if dist.get_rank() == 0:
-    plot_graph(value=loss_per_step, title='Training Loss Over Steps', xlabel='Step (Index)', ylabel='Loss')
-    plot_graph(value=time_per_epoch, title="Time per Epoch", xlabel='Epoch', ylabel='Time (s)')
-    plot_graph(value=time_per_step, title="Time per Step", xlabel='Step', ylabel='Time (ms)')
+    plot_graph(loss_per_step, "Training Loss", "Step", "Loss", "loss.png")
+    plot_graph(time_per_epoch, "Time per Epoch", "Epoch", "Time (s)", "epoch_time.png")
+    plot_graph(time_per_step, "Time per Step", "Step", "Time (ms)", "step_time.png")
     per_gpu_utils = create_n_arrray(gpu_utilizations)
-    for i,gpu_util in enumerate(per_gpu_utils):
-      plot_graph(value=gpu_util, title="GPU Utilizations " + str(i), xlabel="Epoch", ylabel='GPU Utilization (%)')
+    for i, gpu_util in enumerate(per_gpu_utils):
+      plot_graph(gpu_util, f"GPU Util {i}", "Epoch", "%", f"gpu_{i}.png")
     avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
     global_batch_size = batch_size * dist.get_world_size()
     throughput = global_batch_size / avg_step_time_s
