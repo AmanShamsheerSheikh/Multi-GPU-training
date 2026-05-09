@@ -171,7 +171,7 @@ def get_gpu_util(gpu_number):
   return util.gpu
 
 
-def train(model, dataloader, sampler, device):
+def train(model, dataloader, sampler, accumulation_steps,  device):
   optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
   criterion = torch.nn.CrossEntropyLoss()
   loss_per_step = []
@@ -181,7 +181,6 @@ def train(model, dataloader, sampler, device):
   starter = torch.cuda.Event(enable_timing=True)
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
-  accumulation_steps = 4
   num_epochs = 5
   total_steps = len(dataloader) * num_epochs
   global_pbar = tqdm(total=total_steps, disable=(rank != 0))
@@ -241,7 +240,7 @@ def train(model, dataloader, sampler, device):
   else:
     return None, None, None, None
 
-def create_n_arrray(gpu_utils):
+def create_n_array(gpu_utils):
   per_gpu_util = []
   temp_arr= []
   for i in range(len(gpu_utils[0])):
@@ -256,19 +255,19 @@ def main():
   if dist.get_rank() == 0:
     pynvml.nvmlInit()
   device = get_device()
-  batch_size=64
+  batch_size=256 // dist.get_world_size()
   dataloader, sampler = get_dataloader(batch_size)
   model = get_model(device)
   model.train()
   accumulation_steps = 4
   training_start_time = time.time()
-  loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, device)
+  loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, accumulation_steps,device)
   total_time_taken = time.time() - training_start_time
   if dist.get_rank() == 0:
     plot_graph(loss_per_step, "Training Loss", "Step", "Loss", "loss.png")
     plot_graph(time_per_epoch, "Time per Epoch", "Epoch", "Time (s)", "epoch_time.png")
     plot_graph(time_per_step, "Time per Step", "Step", "Time (ms)", "step_time.png")
-    per_gpu_utils = create_n_arrray(gpu_utilizations)
+    per_gpu_utils = create_n_array(gpu_utilizations)
     for i, gpu_util in enumerate(per_gpu_utils):
       plot_graph(gpu_util, f"GPU Util {i}", "Step", "%", f"gpu_{i}.png")
     avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
