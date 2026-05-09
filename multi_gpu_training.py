@@ -133,7 +133,7 @@ def get_dataloader(batch_size):
 def get_model(device):
   model = ResNet18(num_classes=10)
   model = model.to(device)
-  model = DDP(model, device_ids=[device.index])
+  model = DDP(model, device_ids=[device.index], bucket_cap_mb=10)
   return model
 
 def plot_graph(value, title, xlabel, ylabel, filename):
@@ -177,12 +177,13 @@ def train(model, dataloader, sampler, device):
   starter = torch.cuda.Event(enable_timing=True)
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
+  accumulation_steps = 4
   for epoch in range(5):
     sampler.set_epoch(epoch)  # it sets the epoch for the shuffling of the images per epoch 
     i = 0
     if rank == 0:
       epoch_start = time.time()
-
+    optimizer.zero_grad(set_to_none=True)
     for images, labels in dataloader:
       images = images.to(device, non_blocking=True)
       labels = labels.to(device, non_blocking=True)
@@ -191,13 +192,21 @@ def train(model, dataloader, sampler, device):
         torch.cuda.synchronize()
         starter.record()
 
-      optimizer.zero_grad()
-      outputs = model(images)
-      loss = criterion(outputs, labels)
-      loss.backward()   # all-reduce happens here
+      if (i + 1) % accumulation_steps == 0 or (i+1) == len(dataloader):
+        outputs = model(images)
+        raw_loss = criterion(outputs, labels)
+        loss = raw_loss / accumulation_steps # later read a bit more why this is done.
+        loss.backward()   # all-reduce happens here
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+      else:
+        with model.no_sync():
+          outputs = model(images)
+          raw_loss = criterion(outputs, labels)
+          loss = raw_loss / accumulation_steps
+          loss.backward()
       if epoch == 0 and i == 0:
         check_gradients(model)
-      optimizer.step()
 
       if rank == 0:
         ender.record()
@@ -205,17 +214,18 @@ def train(model, dataloader, sampler, device):
         time_per_step.append(starter.elapsed_time(ender))
 
       with torch.no_grad():
-        reduced_loss = loss.detach()
+        reduced_loss = raw_loss.detach()
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
         reduced_loss /= dist.get_world_size()
+        if i%10 == 0 and dist.get_rank() == 0:
+          utils = [get_gpu_util(i) for i in range(torch.cuda.device_count())]
+          gpu_utilizations.append(utils)
       if rank == 0:
           loss_per_step.append(reduced_loss.item())
       i += 1
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
       time_per_epoch.append(time.time() - epoch_start)
-      utils = [get_gpu_util(i) for i in range(torch.cuda.device_count())]
-      gpu_utilizations.append(utils)
   if rank == 0:
     return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
   else:
@@ -239,7 +249,7 @@ def main():
   batch_size=256
   dataloader, sampler = get_dataloader(batch_size)
   model = get_model(device)
-
+  accumulation_steps = 4
   training_start_time = time.time()
   loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, device)
   total_time_taken = time.time() - training_start_time
@@ -249,11 +259,17 @@ def main():
     plot_graph(time_per_step, "Time per Step", "Step", "Time (ms)", "step_time.png")
     per_gpu_utils = create_n_arrray(gpu_utilizations)
     for i, gpu_util in enumerate(per_gpu_utils):
-      plot_graph(gpu_util, f"GPU Util {i}", "Epoch", "%", f"gpu_{i}.png")
+      plot_graph(gpu_util, f"GPU Util {i}", "Step", "%", f"gpu_{i}.png")
     avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
     global_batch_size = batch_size * dist.get_world_size()
-    throughput = global_batch_size / avg_step_time_s
+    effective_batch_size = global_batch_size * accumulation_steps
+    throughput = effective_batch_size / avg_step_time_s
     print("throughput: ", throughput)
     print("Total time taken: ", total_time_taken)
+    for i in range(len(per_gpu_utils)):
+      print(f"average gpu utilization for gpu {i}: ", sum(per_gpu_utils[i])/len(per_gpu_utils[i]))
   torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{dist.get_world_size()}.pt')
   dist.destroy_process_group()
+
+if __name__ == '__main__':
+  main()
