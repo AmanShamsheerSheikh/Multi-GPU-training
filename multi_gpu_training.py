@@ -134,7 +134,7 @@ def get_dataloader(batch_size):
 def get_model(device):
   model = ResNet18(num_classes=10)
   model = model.to(device)
-  model = DDP(model, device_ids=[device.index], bucket_cap_mb=10)
+  model = DDP(model, device_ids=[device.index])
   return model
 
 def plot_graph(value, title, xlabel, ylabel, filename):
@@ -143,7 +143,10 @@ def plot_graph(value, title, xlabel, ylabel, filename):
   plt.title(title)
   plt.xlabel(xlabel)
   plt.ylabel(ylabel)
-  plt.savefig(filename)
+  folder = f"../plots_GPU_{dist.get_world_size()}"
+  os.makedirs(folder, exist_ok=True)
+  plot_path = f"{folder}/{filename}"
+  plt.savefig(plot_path)
   plt.close()
 
 def check_gradients(model):
@@ -179,19 +182,17 @@ def train(model, dataloader, sampler, device):
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
   accumulation_steps = 4
-  for epoch in range(5):
+  num_epochs = 5
+  total_steps = len(dataloader) * num_epochs
+  global_pbar = tqdm(total=total_steps, disable=(rank != 0))
+  for epoch in range(num_epochs):
     sampler.set_epoch(epoch)  # it sets the epoch for the shuffling of the images per epoch 
     i = 0
     if rank == 0:
       epoch_start = time.time()
     optimizer.zero_grad(set_to_none=True)
-    progress_bar = tqdm(
-      dataloader,
-      desc=f"Epoch {epoch+1}",
-      disable=(rank != 0)
-    )
 
-    for images, labels in progress_bar:
+    for images, labels in dataloader:
       images = images.to(device, non_blocking=True)
       labels = labels.to(device, non_blocking=True)
 
@@ -219,6 +220,7 @@ def train(model, dataloader, sampler, device):
         ender.record()
         torch.cuda.synchronize()
         time_per_step.append(starter.elapsed_time(ender))
+        global_pbar.update(1)
 
       with torch.no_grad():
         reduced_loss = raw_loss.detach()
@@ -233,9 +235,7 @@ def train(model, dataloader, sampler, device):
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
       time_per_epoch.append(time.time() - epoch_start)
-      progress_bar.set_postfix({
-        "loss": f"{reduced_loss.item():.4f}"
-      })
+  global_pbar.close()
   if rank == 0:
     return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
   else:
@@ -256,9 +256,10 @@ def main():
   if dist.get_rank() == 0:
     pynvml.nvmlInit()
   device = get_device()
-  batch_size=256
+  batch_size=64
   dataloader, sampler = get_dataloader(batch_size)
   model = get_model(device)
+  model.train()
   accumulation_steps = 4
   training_start_time = time.time()
   loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, device)
@@ -276,6 +277,7 @@ def main():
     throughput = effective_batch_size / avg_step_time_s
     print("throughput: ", throughput)
     print("Total time taken: ", total_time_taken)
+    print("average step time: ", avg_step_time_s)
     for i in range(len(per_gpu_utils)):
       print(f"average gpu utilization for gpu {i}: ", sum(per_gpu_utils[i])/len(per_gpu_utils[i]))
   torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{dist.get_world_size()}.pt')
