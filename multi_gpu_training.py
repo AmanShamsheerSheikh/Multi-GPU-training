@@ -8,6 +8,7 @@ from torch.utils.data.distributed import DistributedSampler
 import matplotlib.pyplot as plt
 import time
 import pynvml
+from tqdm import tqdm
 
 class ResNetBlock(nn.Module):
   def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, bias=False):
@@ -184,7 +185,13 @@ def train(model, dataloader, sampler, device):
     if rank == 0:
       epoch_start = time.time()
     optimizer.zero_grad(set_to_none=True)
-    for images, labels in dataloader:
+    progress_bar = tqdm(
+      dataloader,
+      desc=f"Epoch {epoch+1}",
+      disable=(rank != 0)
+    )
+
+    for images, labels in progress_bar:
       images = images.to(device, non_blocking=True)
       labels = labels.to(device, non_blocking=True)
 
@@ -226,6 +233,9 @@ def train(model, dataloader, sampler, device):
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
       time_per_epoch.append(time.time() - epoch_start)
+      progress_bar.set_postfix({
+        "loss": f"{reduced_loss.item():.4f}"
+      })
   if rank == 0:
     return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
   else:
