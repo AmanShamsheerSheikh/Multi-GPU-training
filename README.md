@@ -16,7 +16,7 @@ This project implements a distributed training pipeline that enables data-parall
 git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
 cd Multi-GPU-training/
 pip install -r requirements.txt
-```bash
+```
 
 ## Project Overview
 This project implements a distributed training pipeline that enables data-parallel training of models across multiple GPUs. It uses torchrun to initialize processes, DistributedSampler to partition data across GPUs, and DistributedDataParallel (DDP) for synchronized training. Gradient computation is handled by PyTorch autograd, while NCCL is used for efficient inter-GPU communication and gradient synchronization.
@@ -107,8 +107,7 @@ hence the number of GPUs should be tested and chosen wisely.
 	3. Round robin process groups -  In round-robin process groups, multiple process groups are created to enable parallel communication. Gradient buckets are deterministically assigned to these process groups (e.g., bucket 1 and 3 use process group 1, while bucket 2 and 4 use process group 2).
 	During training, AllReduce operations for different buckets are launched using their assigned process groups, allowing multiple communication operations to run concurrently.
 	This improves communication efficiency by better utilizing available bandwidth and overlapping multiple AllReduce operations, which can reduce per-step training time and improve overall GPU efficiency.
-	4. Gradient order prediction - Initially when the buckets are created they are created using greedy bucketing algorithm that means all the params while the bucket limit is not set and then move on to the next bucket.
-After a couple of iterations the buckets are recreated by observing the backward computation order of the parameters, the buckets are created throughout all the GPUs and are same.
+	4. Gradient order prediction - Initially when the buckets are created they are created using greedy bucketing algorithm that means all the params while the bucket limit is not set and then move on to the next bucket. After a couple of iterations the buckets are recreated by observing the backward computation order of the parameters, the buckets are created throughout all the GPUs and are same.
 	5. Layer Dropping - Layer dropping (e.g., stochastic depth) can be used to reduce overfitting by skipping layers during the forward pass. While DDP correctly handles skipped parameters, it does not reduce communication overhead because gradient synchronization operates at the bucket level. To address this, buckets can be aligned with layers so that entire buckets can be skipped when layers are dropped, enabling potential communication savings. However, this requires coordination across all processes to ensure consistent behavior.
 	6. Prioritizing the initial layers buckets - In this optimization strategy the all reduce of the buckets from the initial layer is prioritized over the later layers as the forward for the next iteration can start even if the communication of the previous layers are remaining.
 
@@ -118,8 +117,9 @@ After a couple of iterations the buckets are recreated by observing the backward
 
 As evident from the table below using accumulation step increases the throughput and efficiency of training, as the communication overhead gets reduced due to less all reduce calls. The all-reduce communication occurs every 4 steps instead of every step. This approximates training with a larger effective batch size while reducing synchronization frequency.
 
-Number of GPU's	Throughput  (images/sec)	Speedup	Efficiency (in %)	Total training time (in sec)	Average Step time (in sec)
-4	18765.065797789888	3.0612928867019487	76	59.15190935134888	0.05456948624824991
-2	11106.43343900814	1.8303386327000886	91	98.93323349952698	0.0921988148241627
-1	5988.976761275212	NA	NA	181.0813193321228	0.17098079368435606 
+| Number of GPUs | Throughput (images/sec) | Speedup | Efficiency (%) | Total Training Time (sec) | Average Step Time (sec) |
+|----------------|--------------------------|----------|----------------|----------------------------|--------------------------|
+| 1 GPU | 5988.98 | NA | NA | 181.08 | 0.1709 |
+| 2 GPUs | 11106.43 | 1.83x | 91% | 98.93 | 0.0922 |
+| 4 GPUs | 18765.07 | 3.06x | 76% | 59.15 | 0.0546 |
 

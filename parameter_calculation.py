@@ -1,7 +1,7 @@
 # ran on 12-04-2026
-time_taken_1_GPU = 123.43308782577515
-time_taken_2_GPU = 66.92722129821777
-time_taken_4_GPU = 174.81013369560242
+time_taken_1_GPU = 181.0813193321228
+time_taken_2_GPU = 98.93323349952698
+time_taken_4_GPU = 59.15190935134888
 
 # speedup and effiicicney for 2 GPU's
 speedup_2 = time_taken_1_GPU / time_taken_2_GPU
