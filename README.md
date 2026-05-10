@@ -13,7 +13,7 @@ This project implements a distributed training pipeline that enables data-parall
 
 **Installation:**
 ```bash
-git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
+git clone https://github.com/AmanShamsheerSheikh/Multi-GPU-training.git
 cd Multi-GPU-training/
 pip install -r requirements.txt
 ```
