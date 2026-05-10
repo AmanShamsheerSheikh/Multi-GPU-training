@@ -16,6 +16,7 @@ This project implements a distributed training pipeline that enables data-parall
 git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
 cd Multi-GPU-training/
 pip install -r requirements.txt
+```bash
 
 ## Project Overview
 This project implements a distributed training pipeline that enables data-parallel training of models across multiple GPUs. It uses torchrun to initialize processes, DistributedSampler to partition data across GPUs, and DistributedDataParallel (DDP) for synchronized training. Gradient computation is handled by PyTorch autograd, while NCCL is used for efficient inter-GPU communication and gradient synchronization.
