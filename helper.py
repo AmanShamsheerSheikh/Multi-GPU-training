@@ -54,7 +54,7 @@ def parse_args():
         "--dataset_name", 
         type=str, 
         required=True, 
-        help="The dataset for training or tuning"
+        help="The dataset name for training or tuning"
     )
     parser.add_argument(
         "--job_type", 
@@ -69,17 +69,27 @@ def parse_args():
         default=10, 
         help="Number of epochs to train."
     )
+    parser.add_argument(
+        "--text_column_name", 
+        type=str, 
+        required=True, 
+        help="text column name of dataset"
+    )
+    parser.add_argument(
+        "--gpu_count", 
+        type=int, 
+        default=1,
+        help="Number of gpu used"
+    )
     return parser.parse_args()
 
-def concat_images():
-  GPUS = [1,2,4]
-  for gpu in GPUS:
-      folder_path = f'./data/plots_GPU_{gpu}'
-      reads = []
-      for images in os.listdir(folder_path):
-          if images.startswith('gpu'):
-              print(images)
-              full_image_path = os.path.join(folder_path, images)
-              reads.append(cv2.imread(full_image_path))
-      concat = cv2.hconcat(reads)
-      cv2.imwrite(f'./data/plots_GPU_{gpu}/plot_GPU_{gpu}.png',concat)
+def concat_images(gpu_count):
+  folder_path = f'./data/plots_GPU_{gpu_count}'
+  reads = []
+  for images in os.listdir(folder_path):
+      if images.startswith('gpu'):
+          print(images)
+          full_image_path = os.path.join(folder_path, images)
+          reads.append(cv2.imread(full_image_path))
+  concat = cv2.hconcat(reads)
+  cv2.imwrite(f'./data/plots_GPU_{gpu_count}/plot_GPU_{gpu_count}.png',concat)

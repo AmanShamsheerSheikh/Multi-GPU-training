@@ -8,7 +8,10 @@ import time
 import pynvml
 from tqdm import tqdm
 from helper import plot_graphs_log_data, parse_args, concat_images
-from constants import TRAIN, TUNE, ACCUMULATION_STEPS, BATCH_SIZE
+from constants import TRAIN, TUNE, ACCUMULATION_STEPS, BATCH_SIZE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+
 
 """DDP Code"""
 
@@ -29,16 +32,16 @@ def get_device():
   torch.cuda.set_device(local_rank)
   return torch.device("cuda", local_rank)
 
-def get_dataloader(batch_size, dataset):
-  sampler = DistributedSampler(dataset)
+def get_dataloader(batch_size, dataset, world_size, rank, epoch):
+  sharded = dataset.shard(num_shards=world_size, index=rank)
+  shuffled = sharded.shuffle(seed=DATA_LOADER_SEED + epoch, buffer_size=DATA_LOADER_BUFFER_SIZE)
   dataloader = DataLoader(
-    dataset,
+    shuffled,
     batch_size=batch_size,
-    sampler=sampler,
     num_workers=4,
     pin_memory=True
   )
-  return dataloader, sampler
+  return dataloader
 
 def get_model(device, model):
   model = model.to(device)
@@ -66,9 +69,12 @@ def get_gpu_util(gpu_number):
   return util.gpu
 
 
-def train(model, dataloader, sampler, accumulation_steps, device, world_size):
-  optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-  criterion = torch.nn.CrossEntropyLoss()
+def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size):
+  optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=2e-5,
+    weight_decay=0.01
+  )
   loss_per_step = []
   time_per_step = []
   time_per_epoch = []
@@ -76,35 +82,41 @@ def train(model, dataloader, sampler, accumulation_steps, device, world_size):
   starter = torch.cuda.Event(enable_timing=True)
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
-  num_epochs = 5
-  total_steps = len(dataloader) * num_epochs
-  global_pbar = tqdm(total=total_steps, disable=(rank != 0))
-  for epoch in range(num_epochs):
-    sampler.set_epoch(epoch)  # it sets the epoch for the shuffling of the images per epoch 
+  for epoch in range(epochs):
+    dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch)
+    # sampler.set_epoch(epoch)  # it sets the epoch for the shuffling of the images per epoch 
     i = 0
     if rank == 0:
       epoch_start = time.time()
+      pbar = tqdm(desc=f"Epoch {epoch+1}/{epochs}")
     optimizer.zero_grad(set_to_none=True)
 
-    for images, labels in dataloader:
-      images = images.to(device, non_blocking=True)
-      labels = labels.to(device, non_blocking=True)
-
+    for batch in dataloader:
+      input_ids = batch["input_ids"].to(device, non_blocking=True)
+      attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+      labels = batch["labels"].to(device, non_blocking=True)
       if rank == 0:
         torch.cuda.synchronize()
         starter.record()
-
-      if (i + 1) % accumulation_steps == 0 or (i+1) == len(dataloader):
-        outputs = model(images)
-        raw_loss = criterion(outputs, labels)
+      if (i + 1) % accumulation_steps == 0:
+        outputs = model(
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          labels=labels
+        )
+        raw_loss = outputs.loss
         loss = raw_loss / accumulation_steps # later read a bit more why this is done.
         loss.backward()   # all-reduce happens here
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
       else:
         with model.no_sync():
-          outputs = model(images)
-          raw_loss = criterion(outputs, labels)
+          outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+          )
+          raw_loss = outputs.loss
           loss = raw_loss / accumulation_steps
           loss.backward()
       if epoch == 0 and i == 0:
@@ -114,50 +126,79 @@ def train(model, dataloader, sampler, accumulation_steps, device, world_size):
         ender.record()
         torch.cuda.synchronize()
         time_per_step.append(starter.elapsed_time(ender))
-        global_pbar.update(1)
 
       with torch.no_grad():
         reduced_loss = raw_loss.detach()
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
         reduced_loss /= world_size
         if i%10 == 0 and dist.get_rank() == 0:
-          utils = [get_gpu_util(i) for i in range(torch.cuda.device_count())]
+          utils = [get_gpu_util(j) for j in range(torch.cuda.device_count())]
           gpu_utilizations.append(utils)
       if rank == 0:
-          loss_per_step.append(reduced_loss.item())
+        loss_per_step.append(reduced_loss.item())
+        pbar.update(1)
+        pbar.set_postfix(loss=reduced_loss.item())
       i += 1
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
       time_per_epoch.append(time.time() - epoch_start)
-  global_pbar.close()
+      pbar.close()
   if rank == 0:
     return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
   else:
     return None, None, None, None
+  
+def preprocess_dataset(dataset, tokenizer, text_column: str):
+  def tokenize(batch):
+      tokens = tokenizer(
+          batch[text_column],
+          truncation=True,
+          max_length=512,
+          padding="max_length",
+      )
+      labels = tokens["input_ids"].copy()
+      tokens["labels"] = [
+        [-100 if t == tokenizer.pad_token_id else t for t in label]
+        for label in labels
+      ]
+      return tokens
+  sample = next(iter(dataset))
+  original_columns = list(sample.keys())
+  return dataset.map(tokenize, batched=True, remove_columns=original_columns)
+  
+def load_model_struct_dataset(model_name, dataset_name, text_column):
+  config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+  model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, torch_dtype=torch.bfloat16)
+  dataset = load_dataset(
+    dataset_name,
+    streaming=True,
+  )
+  tokenizer = AutoTokenizer.from_pretrained(model_name)
+  dataset = preprocess_dataset(dataset, tokenizer, text_column)
+  return model, dataset
 
-def main(model, dataset, job_type, epochs):
+def main(model, dataset, job_type, epochs, gpu_count):
   if job_type == TRAIN:
     setup_ddp()
-    if dist.get_rank() == 0:
-      pynvml.nvmlInit()
+    pynvml.nvmlInit()
     world_size = dist.get_world_size()
     batch_size= BATCH_SIZE // world_size
     accumulation_steps = ACCUMULATION_STEPS
     device = get_device()
-    dataloader, sampler = get_dataloader(batch_size, dataset)
     model = get_model(device, model)
     model.train()
     training_start_time = time.time()
-    loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, accumulation_steps, device, world_size)
+    loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size)
     total_time_taken = time.time() - training_start_time
     if dist.get_rank() == 0:
       plot_graphs_log_data(loss_per_step, time_per_epoch, time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size)
-      concat_images()
-    torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{world_size}.pt')
+      concat_images(gpu_count)
+      torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{world_size}.pt')
     dist.destroy_process_group()
   elif job_type == TUNE:
     print('coming soon')
 
 if __name__ == '__main__':
   args = parse_args()
-  main(args.model_name, args.dataset_name, args.job_type, args.epochs)
+  model, dataset = load_model_struct_dataset(args.model_name, args.dataset_name, args.text_column_name)
+  main(model, dataset, args.job_type, args.epochs, args.gpu_count)
