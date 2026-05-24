@@ -1,0 +1,20 @@
+# Core training
+torch==2.2.0
+torchvision==0.17.0
+transformers==4.40.0
+datasets==2.19.0
+accelerate==0.29.0
+peft==0.10.0
+nvidia-ml-py>=12.0.0
+matplotlib==3.8.4
+opencv-python-headless==4.10.0.84
+
+# RunPod
+runpod==1.6.2
+
+# Monitoring & utilities
+tqdm==4.66.2
+numpy==1.26.4
+
+# HuggingFace auth
+huggingface-hub==0.22.2

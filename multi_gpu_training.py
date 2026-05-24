@@ -1,88 +1,14 @@
-import torch.nn as nn
 import os
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-import matplotlib.pyplot as plt
 import time
 import pynvml
 from tqdm import tqdm
-
-class ResNetBlock(nn.Module):
-  def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, bias=False):
-    super().__init__()
-    self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)
-    self.batchNorm1 = nn.BatchNorm2d(num_features=out_channels)
-    self.conv2 = nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
-    self.batchNorm2 = nn.BatchNorm2d(num_features=out_channels)
-    self.relu = nn.ReLU(inplace=True)
-    self.shortcut = nn.Identity()
-    if stride != 1 or in_channels != out_channels:
-      self.shortcut = nn.Sequential(
-          nn.Conv2d(
-              in_channels=in_channels, out_channels=out_channels,
-              kernel_size=1, stride=stride, bias=False
-          ),
-          nn.BatchNorm2d(num_features=out_channels)
-      )
-
-  def forward(self, x):
-    out = self.conv1(x)
-    out = self.batchNorm1(out)
-    out = self.relu(out)
-    out = self.conv2(out)
-    out = self.batchNorm2(out)
-    out = out + self.shortcut(x)
-    return self.relu(out)
-
-class ResNet18(nn.Module):
-    def __init__(self, num_classes=1000):
-      super().__init__()
-
-      self.in_channels = 64
-
-      self.conv1 = nn.Conv2d(
-        3, 64, kernel_size=7, stride=2, padding=3, bias=False
-      )
-      self.bn1 = nn.BatchNorm2d(64)
-      self.relu = nn.ReLU(inplace=True)
-      self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-      self.layer1 = self._make_layer(64,  2, stride=1)
-      self.layer2 = self._make_layer(128, 2, stride=2)
-      self.layer3 = self._make_layer(256, 2, stride=2)
-      self.layer4 = self._make_layer(512, 2, stride=2)
-
-      self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-      self.fc = nn.Linear(512, num_classes)
-
-    def _make_layer(self, out_channels, num_blocks, stride):
-      layers = []
-
-      layers.append(ResNetBlock(self.in_channels, out_channels, 3, stride))
-      self.in_channels = out_channels
-
-      for _ in range(1, num_blocks):
-          layers.append(ResNetBlock(out_channels, out_channels, 3))
-
-      return nn.Sequential(*layers)
-
-    def forward(self, x):
-      x = self.relu(self.bn1(self.conv1(x)))
-      x = self.maxpool(x)
-
-      x = self.layer1(x)
-      x = self.layer2(x)
-      x = self.layer3(x)
-      x = self.layer4(x)
-
-      x = self.avgpool(x)
-      x = torch.flatten(x, 1)
-      x = self.fc(x)
-
-      return x
+from helper import plot_graphs_log_data, parse_args, concat_images
+from constants import TRAIN, TUNE, ACCUMULATION_STEPS, BATCH_SIZE
 
 """DDP Code"""
 
@@ -103,24 +29,8 @@ def get_device():
   torch.cuda.set_device(local_rank)
   return torch.device("cuda", local_rank)
 
-def get_dataloader(batch_size):
-  from torchvision.datasets import CIFAR10
-  from torchvision import transforms
-
-  dataset_transforms = transforms.Compose([
-    transforms.Resize(224),
-    transforms.ToTensor()
-  ])
-
-  dataset = CIFAR10(
-    root="./data",
-    train=True,
-    download=True,
-    transform=dataset_transforms,
-  )
-
+def get_dataloader(batch_size, dataset):
   sampler = DistributedSampler(dataset)
-
   dataloader = DataLoader(
     dataset,
     batch_size=batch_size,
@@ -128,26 +38,12 @@ def get_dataloader(batch_size):
     num_workers=4,
     pin_memory=True
   )
-
   return dataloader, sampler
 
-def get_model(device):
-  model = ResNet18(num_classes=10)
+def get_model(device, model):
   model = model.to(device)
   model = DDP(model, device_ids=[device.index])
   return model
-
-def plot_graph(value, title, xlabel, ylabel, filename):
-  plt.figure()
-  plt.plot(value)
-  plt.title(title)
-  plt.xlabel(xlabel)
-  plt.ylabel(ylabel)
-  folder = f"../plots_GPU_{dist.get_world_size()}"
-  os.makedirs(folder, exist_ok=True)
-  plot_path = f"{folder}/{filename}"
-  plt.savefig(plot_path)
-  plt.close()
 
 def check_gradients(model):
   with torch.no_grad():
@@ -167,11 +63,10 @@ def check_gradients(model):
 def get_gpu_util(gpu_number):
   handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_number)  # GPU 0
   util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-  mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
   return util.gpu
 
 
-def train(model, dataloader, sampler, accumulation_steps,  device):
+def train(model, dataloader, sampler, accumulation_steps, device, world_size):
   optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
   criterion = torch.nn.CrossEntropyLoss()
   loss_per_step = []
@@ -224,7 +119,7 @@ def train(model, dataloader, sampler, accumulation_steps,  device):
       with torch.no_grad():
         reduced_loss = raw_loss.detach()
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
-        reduced_loss /= dist.get_world_size()
+        reduced_loss /= world_size
         if i%10 == 0 and dist.get_rank() == 0:
           utils = [get_gpu_util(i) for i in range(torch.cuda.device_count())]
           gpu_utilizations.append(utils)
@@ -240,47 +135,29 @@ def train(model, dataloader, sampler, accumulation_steps,  device):
   else:
     return None, None, None, None
 
-def create_n_array(gpu_utils):
-  per_gpu_util = []
-  temp_arr= []
-  for i in range(len(gpu_utils[0])):
-    temp_arr = []
-    for j in range(len(gpu_utils)):
-      temp_arr.append(gpu_utils[j][i])
-    per_gpu_util.append(temp_arr)
-  return per_gpu_util
-
-def main():
-  setup_ddp()
-  if dist.get_rank() == 0:
-    pynvml.nvmlInit()
-  device = get_device()
-  batch_size=256 // dist.get_world_size()
-  dataloader, sampler = get_dataloader(batch_size)
-  model = get_model(device)
-  model.train()
-  accumulation_steps = 4
-  training_start_time = time.time()
-  loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, accumulation_steps,device)
-  total_time_taken = time.time() - training_start_time
-  if dist.get_rank() == 0:
-    plot_graph(loss_per_step, "Training Loss", "Step", "Loss", "loss.png")
-    plot_graph(time_per_epoch, "Time per Epoch", "Epoch", "Time (s)", "epoch_time.png")
-    plot_graph(time_per_step, "Time per Step", "Step", "Time (ms)", "step_time.png")
-    per_gpu_utils = create_n_array(gpu_utilizations)
-    for i, gpu_util in enumerate(per_gpu_utils):
-      plot_graph(gpu_util, f"GPU Util {i}", "Step", "%", f"gpu_{i}.png")
-    avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
-    global_batch_size = batch_size * dist.get_world_size()
-    effective_batch_size = global_batch_size * accumulation_steps
-    throughput = effective_batch_size / avg_step_time_s
-    print("throughput: ", throughput)
-    print("Total time taken: ", total_time_taken)
-    print("average step time: ", avg_step_time_s)
-    for i in range(len(per_gpu_utils)):
-      print(f"average gpu utilization for gpu {i}: ", sum(per_gpu_utils[i])/len(per_gpu_utils[i]))
-  torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{dist.get_world_size()}.pt')
-  dist.destroy_process_group()
+def main(model, dataset, job_type, epochs):
+  if job_type == TRAIN:
+    setup_ddp()
+    if dist.get_rank() == 0:
+      pynvml.nvmlInit()
+    world_size = dist.get_world_size()
+    batch_size= BATCH_SIZE // world_size
+    accumulation_steps = ACCUMULATION_STEPS
+    device = get_device()
+    dataloader, sampler = get_dataloader(batch_size, dataset)
+    model = get_model(device, model)
+    model.train()
+    training_start_time = time.time()
+    loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataloader, sampler, accumulation_steps, device, world_size)
+    total_time_taken = time.time() - training_start_time
+    if dist.get_rank() == 0:
+      plot_graphs_log_data(loss_per_step, time_per_epoch, time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size)
+      concat_images()
+    torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{world_size}.pt')
+    dist.destroy_process_group()
+  elif job_type == TUNE:
+    print('coming soon')
 
 if __name__ == '__main__':
-  main()
+  args = parse_args()
+  main(args.model_name, args.dataset_name, args.job_type, args.epochs)

@@ -1,0 +1,4 @@
+BATCH_SIZE = 256
+ACCUMULATION_STEPS = 4
+TRAIN = 'train'
+TUNE = 'tune'
