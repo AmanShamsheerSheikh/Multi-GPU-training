@@ -21,10 +21,10 @@ def handler(job):
         "--model_name", str(model_name),
         "--dataset_name", str(dataset_name),
         "--job_type", str(job_type),
-        "--epochs", epochs,
+        "--epochs", str(epochs),
         "--text_column_name", str(text_column_name),
         "--job_id", str(job_id),
-        "--gpu_count", gpu_count
+        "--gpu_count", str(gpu_count)
     ]
     
     try:
