@@ -11,6 +11,7 @@ def handler(job):
     epochs = job_input.get('epochs', 10)
     text_column_name = job_input.get('text_column_name')
     gpu_count = job_input.get('gpu_count', 1)
+    task_type = job_input.get('task_type')
 
     print(f"[RunPod Worker] Launching DDP Cluster across {gpu_count} GPUs...")
 
@@ -24,7 +25,8 @@ def handler(job):
         "--epochs", str(epochs),
         "--text_column_name", str(text_column_name),
         "--job_id", str(job_id),
-        "--gpu_count", str(gpu_count)
+        "--gpu_count", str(gpu_count),
+        "--task_type", str(task_type)
     ]
     
     try:
