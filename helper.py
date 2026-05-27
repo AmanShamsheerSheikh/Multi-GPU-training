@@ -19,7 +19,7 @@ def plot_graph(value, title, xlabel, ylabel, filename, world_size):
   plt.title(title)
   plt.xlabel(xlabel)
   plt.ylabel(ylabel)
-  folder = f"../plots_GPU_{world_size}"
+  folder = f"./data/plots_GPU_{world_size}"
   os.makedirs(folder, exist_ok=True)
   plot_path = f"{folder}/{filename}"
   plt.savefig(plot_path)
@@ -36,14 +36,32 @@ def plot_graphs_log_data(loss_per_step, time_per_epoch, time_per_step, gpu_utili
   global_batch_size = batch_size * world_size
   effective_batch_size = global_batch_size * accumulation_steps
   throughput = effective_batch_size / avg_step_time_s
-  print("throughput: ", throughput)
-  print("Total time taken: ", total_time_taken)
-  print("average step time: ", avg_step_time_s)
-  for i in range(len(per_gpu_utils)):
-    print(f"average gpu utilization for gpu {i}: ", sum(per_gpu_utils[i])/len(per_gpu_utils[i]))
+  with open("./data/training_metrics.txt", "w") as f:
+    f.write(f"Throughput: {throughput}\n")
+    f.write(f"Total time taken: {total_time_taken}\n")
+    f.write(f"Average step time: {avg_step_time_s}\n")
+    for i in range(len(per_gpu_utils)):
+      avg_util = sum(per_gpu_utils[i]) / len(per_gpu_utils[i])
+      f.write(f"Average GPU utilization for GPU {i}: {avg_util}\n")
+
+def concat_images(gpu_count):
+  folder_path = f'./data/plots_GPU_{gpu_count}'
+  reads = []
+  for images in os.listdir(folder_path):
+    if images.startswith('gpu'):
+      full_image_path = os.path.join(folder_path, images)
+      reads.append(cv2.imread(full_image_path))
+  concat = cv2.hconcat(reads)
+  cv2.imwrite(f'./data/plots_GPU_{gpu_count}/plot_GPU_{gpu_count}.png',concat)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PyTorch DDP Training Cluster")
+    parser.add_argument(
+        "--job_id", 
+        type=str,
+        required=True, 
+        help="Id of the job."
+    )
     parser.add_argument(
         "--model_name", 
         type=str,
@@ -82,14 +100,3 @@ def parse_args():
         help="Number of gpu used"
     )
     return parser.parse_args()
-
-def concat_images(gpu_count):
-  folder_path = f'./data/plots_GPU_{gpu_count}'
-  reads = []
-  for images in os.listdir(folder_path):
-      if images.startswith('gpu'):
-          print(images)
-          full_image_path = os.path.join(folder_path, images)
-          reads.append(cv2.imread(full_image_path))
-  concat = cv2.hconcat(reads)
-  cv2.imwrite(f'./data/plots_GPU_{gpu_count}/plot_GPU_{gpu_count}.png',concat)

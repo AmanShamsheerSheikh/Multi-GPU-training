@@ -3,7 +3,6 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 import time
 import pynvml
 from tqdm import tqdm
@@ -63,13 +62,13 @@ def check_gradients(model):
     if dist.get_rank() == 0:
       print("Gradient max diff:", max_diff.item())
 
-def get_gpu_util(gpu_number):
+def get_gpu_util(gpu_number) -> int:
   handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_number)  # GPU 0
   util = pynvml.nvmlDeviceGetUtilizationRates(handle)
   return util.gpu
 
 
-def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size):
+def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, job_id):
   optimizer = torch.optim.AdamW(
     model.parameters(),
     lr=2e-5,
@@ -177,7 +176,7 @@ def load_model_struct_dataset(model_name, dataset_name, text_column):
   dataset = preprocess_dataset(dataset, tokenizer, text_column)
   return model, dataset
 
-def main(model, dataset, job_type, epochs, gpu_count):
+def main(model, dataset, job_type, epochs, gpu_count, job_id):
   if job_type == TRAIN:
     setup_ddp()
     pynvml.nvmlInit()
@@ -188,12 +187,13 @@ def main(model, dataset, job_type, epochs, gpu_count):
     model = get_model(device, model)
     model.train()
     training_start_time = time.time()
-    loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size)
+    loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, job_id)
     total_time_taken = time.time() - training_start_time
     if dist.get_rank() == 0:
+      os.makedirs('data', exist_ok=True)
       plot_graphs_log_data(loss_per_step, time_per_epoch, time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size)
       concat_images(gpu_count)
-      torch.save(model.module.state_dict(), f'./model_{dist.get_rank()}_{world_size}.pt')
+      torch.save(model.module.state_dict(), f'./data/model_{dist.get_rank()}_{world_size}.pt')
     dist.destroy_process_group()
   elif job_type == TUNE:
     print('coming soon')
@@ -201,4 +201,4 @@ def main(model, dataset, job_type, epochs, gpu_count):
 if __name__ == '__main__':
   args = parse_args()
   model, dataset = load_model_struct_dataset(args.model_name, args.dataset_name, args.text_column_name)
-  main(model, dataset, args.job_type, args.epochs, args.gpu_count)
+  main(model, dataset, args.job_type, args.epochs, args.gpu_count, args.job_id)
