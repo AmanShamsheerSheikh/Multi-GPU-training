@@ -10,6 +10,7 @@ from helper import plot_graphs_log_data, parse_args, concat_images, log_progress
 from constants import TUNE, ACCUMULATION_STEPS, BATCH_SIZE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+from datasets.distributed import split_dataset_by_node
 
 """DDP Code"""
 
@@ -31,7 +32,7 @@ def get_device():
   return torch.device("cuda", local_rank)
 
 def get_dataloader(batch_size, dataset, world_size, rank, epoch):
-  sharded = dataset.shard(num_shards=world_size, index=rank)
+  sharded = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
   shuffled = sharded.shuffle(seed=DATA_LOADER_SEED + epoch, buffer_size=DATA_LOADER_BUFFER_SIZE)
   dataloader = DataLoader(
     shuffled,
@@ -127,6 +128,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
         dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
         reduced_loss /= world_size
         if i%10 == 0 and dist.get_rank() == 0:
+          gpu_utilizations = []
           utils = [get_gpu_util(j) for j in range(torch.cuda.device_count())]
           gpu_utilizations.append(utils)
           log_progress(output_dir, epoch, epochs, i, reduced_loss.item(), gpu_utilizations)
@@ -155,8 +157,8 @@ def preprocess_dataset(dataset, tokenizer, text_column: str):
         for label in labels
       ]
       return tokens
-  sample = next(iter(dataset))
-  original_columns = list(sample.keys())
+  original_columns = dataset.column_names
+  dataset = dataset.with_format("torch")
   return dataset.map(tokenize, batched=True, remove_columns=original_columns)
   
 def load_model_struct_dataset(model_name, dataset_name, text_column, job_type, task_type):
@@ -188,7 +190,15 @@ def load_model_struct_dataset(model_name, dataset_name, text_column, job_type, t
     dataset_name,
     streaming=True,
   )
+  if hasattr(dataset, "keys") and callable(dataset.keys):
+    split_name = 'train' if 'train' in dataset.keys() else list(dataset.keys())[0]
+    dataset = dataset[split_name]
+
   tokenizer = AutoTokenizer.from_pretrained(model_name)
+  
+  if tokenizer.pad_token is None:
+      tokenizer.pad_token = tokenizer.eos_token
+      
   dataset = preprocess_dataset(dataset, tokenizer, text_column)
   return model, dataset, optimizer
 
