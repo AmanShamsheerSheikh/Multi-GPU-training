@@ -7,12 +7,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import time
 import pynvml
-from helper import plot_graphs_log_data, parse_args, concat_images, log_progress
-from constants import TUNE, ACCUMULATION_STEPS, BATCH_SIZE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE
+from helper import log_final_metrics, parse_args
+from constants import TUNE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 import wandb
+from huggingface_hub import HfApi
 
 """DDP Code"""
 
@@ -49,21 +50,6 @@ def get_model(device, model):
   model = DDP(model, device_ids=[device.index])
   return model
 
-def check_gradients(model):
-  with torch.no_grad():
-    p = next(model.parameters()).grad
-
-    grad_max = p.clone()
-    grad_min = p.clone()
-
-    dist.all_reduce(grad_max, op=dist.ReduceOp.MAX)
-    dist.all_reduce(grad_min, op=dist.ReduceOp.MIN)
-
-    max_diff = (grad_max - grad_min).abs().max()
-
-    if dist.get_rank() == 0:
-      print("Gradient max diff:", max_diff.item())
-
 def get_gpu_util(gpu_number) -> int:
   handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_number)  # GPU 0
   util = pynvml.nvmlDeviceGetUtilizationRates(handle)
@@ -71,10 +57,7 @@ def get_gpu_util(gpu_number) -> int:
 
 
 def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type):
-  loss_per_step = []
   time_per_step = []
-  time_per_epoch = []
-  gpu_utilizations = []
   starter = torch.cuda.Event(enable_timing=True)
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
@@ -84,23 +67,22 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb.login(key=wandb_api_key)
     wandb.init(
-        project="distrain",
-        name=job_id,
-        config={
-          "model": model_name,
-          "dataset": dataset_name,
-          "epochs": epochs,
-          "step": 0,
-          "batch_size": batch_size,
-          "accumulation_steps": accumulation_steps,
-          "gpu_count": world_size,
-          "job_type": job_type,
-        }
+      project="distrain",
+      name=job_id,
+      config={
+        "model": model_name,
+        "dataset": dataset_name,
+        "epochs": epochs,
+        "step": 0,
+        "batch_size": batch_size,
+        "accumulation_steps": accumulation_steps,
+        "gpu_count": world_size,
+        "job_type": job_type,
+      }
     )
   global_step = 0
   for epoch in range(epochs):
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch)
-    # sampler.set_epoch(epoch)  # it sets the epoch for the shuffling of the images per epoch 
     i = 0
     if rank == 0:
       epoch_start = time.time()
@@ -120,7 +102,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
           labels=labels
         )
         raw_loss = outputs.loss
-        loss = raw_loss / accumulation_steps # later read a bit more why this is done.
+        loss = raw_loss / accumulation_steps
         loss.backward()   # all-reduce happens here
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -134,13 +116,12 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
           raw_loss = outputs.loss
           loss = raw_loss / accumulation_steps
           loss.backward()
-      if epoch == 0 and i == 0:
-        check_gradients(model)
 
       if rank == 0:
         ender.record()
         torch.cuda.synchronize()
         time_per_step.append(starter.elapsed_time(ender))
+        wandb.log({"time_per_step": starter.elapsed_time(ender)})
 
       with torch.no_grad():
         reduced_loss = raw_loss.detach()
@@ -151,26 +132,25 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
           utils = [get_gpu_util(j) for j in range(torch.cuda.device_count())]
           gpu_utilizations.append(utils)
           wandb.log({
-            "loss": reduced_loss.item(),
             "epoch": epoch,
             "step": global_step,
             "gpu_utilization": utils,
           })
           for j, util in enumerate(utils):
             wandb.log({f"gpu_util_rank_{j}": util})
-          # log_progress(output_dir, epoch, epochs, i, reduced_loss.item(), gpu_utilizations)
       if rank == 0:
-        loss_per_step.append(reduced_loss.item())
+        wandb.log({"loss_per_step": reduced_loss})
       i += 1
       global_step += 1
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
-      time_per_epoch.append(time.time() - epoch_start)
+      time_step = time.time() - epoch_start
+      wandb.log({"time_per_epoch": time_step})
   if rank == 0:
     wandb.finish()
-    return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
+    return time_per_step, gpu_utilizations
   else:
-    return None, None, None, None
+    return None, None
   
 def preprocess_dataset(dataset, tokenizer, text_column: str):
   def tokenize(batch):
@@ -231,7 +211,7 @@ def load_model_struct_dataset(model_name, dataset_name, text_column, job_type, t
   dataset = preprocess_dataset(dataset, tokenizer, text_column)
   return model, dataset, optimizer
 
-def main(model, dataset, epochs, gpu_count, optimizer, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps):
+def main(model, dataset, epochs, gpu_count, optimizer, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id):
   setup_ddp()
   pynvml.nvmlInit()
   world_size = dist.get_world_size()
@@ -241,16 +221,23 @@ def main(model, dataset, epochs, gpu_count, optimizer, output_dir, job_id, model
   model = get_model(device, model)
   model.train()
   training_start_time = time.time()
-  loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type)
+  time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type)
   total_time_taken = time.time() - training_start_time
   if dist.get_rank() == 0:
-    plot_graphs_log_data(loss_per_step, time_per_epoch, time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir)
-    concat_images(gpu_count, output_dir)
-    torch.save(model.module.state_dict(), f'{output_dir}/model_{dist.get_rank()}_{world_size}.pt')
+    log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir)
+    api = HfApi()
+    model_dir = f'{output_dir}/model_{dist.get_rank()}_{world_size}.pt'
+    torch.save(model.module.state_dict(), model_dir)
+    api.upload_file(
+      path_or_fileobj=model_dir,
+      path_in_repo="model_final.pt",
+      repo_id=hf_repo_id,
+      token=os.environ.get("HF_TOKEN")
+    )
   dist.destroy_process_group()
 
 if __name__ == '__main__':
   args = parse_args()
   output_dir = f"/runpod-volume/{args.job_id}"
   model, dataset, optimizer = load_model_struct_dataset(args.model_name, args.dataset_name, args.text_column_name, args.job_type, args.task_type)
-  main(model, dataset, args.epochs, args.gpu_count, optimizer, output_dir, args.job_id, args.model_name, args.dataset_name, args.job_type, args.batch_size, args.accumulation_steps)
+  main(model, dataset, args.epochs, args.gpu_count, optimizer, output_dir, args.job_id, args.model_name, args.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id)
