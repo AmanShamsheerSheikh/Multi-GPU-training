@@ -67,52 +67,63 @@ def concat_images(gpu_count, output_dir):
 def parse_args():
     parser = argparse.ArgumentParser(description="PyTorch DDP Training Cluster")
     parser.add_argument(
-        "--job_id", 
-        type=str,
-        required=True, 
-        help="Id of the job."
+      "--job_id", 
+      type=str,
+      required=True, 
+      help="Id of the job."
     )
     parser.add_argument(
-        "--model_name", 
-        type=str,
-        required=True, 
-        help="The specific model architecture to train."
+      "--model_name", 
+      type=str,
+      required=True, 
+      help="The specific model architecture to train."
     )
     parser.add_argument(
-        "--dataset_name", 
-        type=str, 
-        required=True, 
-        help="The dataset name for training or tuning"
+      "--dataset_name", 
+      type=str, 
+      required=True, 
+      help="The dataset name for training or tuning"
     )
     parser.add_argument(
-        "--job_type", 
-        type=str, 
-        required=True, 
-        choices=['train', 'tune'],
-        help="Training or tuning"
+      "--job_type", 
+      type=str, 
+      required=True, 
+      choices=['train', 'tune'],
+      help="Training or tuning"
     )
     parser.add_argument(
-        "--epochs", 
-        type=int, 
-        default=10, 
-        help="Number of epochs to train."
+      "--epochs", 
+      type=int, 
+      default=10, 
+      help="Number of epochs to train."
     )
     parser.add_argument(
-        "--text_column_name", 
-        type=str, 
-        required=True, 
-        help="text column name of dataset"
+      "--text_column_name", 
+      type=str, 
+      required=True, 
+      help="text column name of dataset"
     )
     parser.add_argument(
-        "--gpu_count", 
-        type=int, 
-        default=1,
-        help="Number of gpu used"
+      "--gpu_count", 
+      type=int, 
+      default=1,
+      help="Number of gpu used"
     )
     parser.add_argument(
-        "--task_type", 
-        type=str, 
-        default='',
-        help="finetuning model type"
+      "--task_type", 
+      type=str, 
+      default='',
+      help="finetuning model type"
+    )
+    parser.add_argument(
+      "--batch_size", 
+      type=int,
+      help="batchsize for training"
+    )
+    parser.add_argument(
+      "--accumulation_steps", 
+      type=int,
+      default=1,
+      help="accumulation steps for training"
     )
     return parser.parse_args()

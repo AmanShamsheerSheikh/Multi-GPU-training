@@ -1,16 +1,18 @@
 import os
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import time
 import pynvml
-from tqdm import tqdm
 from helper import plot_graphs_log_data, parse_args, concat_images, log_progress
 from constants import TUNE, ACCUMULATION_STEPS, BATCH_SIZE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
+import wandb
 
 """DDP Code"""
 
@@ -68,7 +70,7 @@ def get_gpu_util(gpu_number) -> int:
   return util.gpu
 
 
-def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir):
+def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type):
   loss_per_step = []
   time_per_step = []
   time_per_epoch = []
@@ -79,6 +81,23 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
   if rank == 0:
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(f'{output_dir}/plots_GPU_{world_size}', exist_ok=True)
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb.login(key=wandb_api_key)
+    wandb.init(
+        project="distrain",
+        name=job_id,
+        config={
+          "model": model_name,
+          "dataset": dataset_name,
+          "epochs": epochs,
+          "step": 0,
+          "batch_size": batch_size,
+          "accumulation_steps": accumulation_steps,
+          "gpu_count": world_size,
+          "job_type": job_type,
+        }
+    )
+  global_step = 0
   for epoch in range(epochs):
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch)
     # sampler.set_epoch(epoch)  # it sets the epoch for the shuffling of the images per epoch 
@@ -131,14 +150,24 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
           gpu_utilizations = []
           utils = [get_gpu_util(j) for j in range(torch.cuda.device_count())]
           gpu_utilizations.append(utils)
-          log_progress(output_dir, epoch, epochs, i, reduced_loss.item(), gpu_utilizations)
+          wandb.log({
+            "loss": reduced_loss.item(),
+            "epoch": epoch,
+            "step": global_step,
+            "gpu_utilization": utils,
+          })
+          for j, util in enumerate(utils):
+            wandb.log({f"gpu_util_rank_{j}": util})
+          # log_progress(output_dir, epoch, epochs, i, reduced_loss.item(), gpu_utilizations)
       if rank == 0:
         loss_per_step.append(reduced_loss.item())
       i += 1
+      global_step += 1
     if dist.get_rank() == 0:
       torch.cuda.synchronize()
       time_per_epoch.append(time.time() - epoch_start)
   if rank == 0:
+    wandb.finish()
     return loss_per_step, time_per_epoch, time_per_step, gpu_utilizations
   else:
     return None, None, None, None
@@ -202,17 +231,17 @@ def load_model_struct_dataset(model_name, dataset_name, text_column, job_type, t
   dataset = preprocess_dataset(dataset, tokenizer, text_column)
   return model, dataset, optimizer
 
-def main(model, dataset, epochs, gpu_count, optimizer, output_dir):
+def main(model, dataset, epochs, gpu_count, optimizer, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps):
   setup_ddp()
   pynvml.nvmlInit()
   world_size = dist.get_world_size()
-  batch_size= BATCH_SIZE // world_size
-  accumulation_steps = ACCUMULATION_STEPS
+  batch_size= batch_size
+  accumulation_steps = accumulation_steps
   device = get_device()
   model = get_model(device, model)
   model.train()
   training_start_time = time.time()
-  loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir)
+  loss_per_step, time_per_epoch, time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type)
   total_time_taken = time.time() - training_start_time
   if dist.get_rank() == 0:
     plot_graphs_log_data(loss_per_step, time_per_epoch, time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir)
@@ -224,4 +253,4 @@ if __name__ == '__main__':
   args = parse_args()
   output_dir = f"/runpod-volume/{args.job_id}"
   model, dataset, optimizer = load_model_struct_dataset(args.model_name, args.dataset_name, args.text_column_name, args.job_type, args.task_type)
-  main(model, dataset, args.epochs, args.gpu_count, optimizer, output_dir)
+  main(model, dataset, args.epochs, args.gpu_count, optimizer, output_dir, args.job_id, args.model_name, args.dataset_name, args.job_type, args.batch_size, args.accumulation_steps)
