@@ -107,4 +107,10 @@ def parse_args():
       type=str,
       help="hugging face model repo"
     )
+    parser.add_argument(
+      "--dataloader_workers", 
+      type=int,
+      default=1,
+      help="workers for dataloader"
+    )
     return parser.parse_args()
