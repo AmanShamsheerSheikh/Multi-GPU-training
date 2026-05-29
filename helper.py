@@ -1,8 +1,7 @@
-import matplotlib.pyplot as plt
-import os
 import argparse
-import cv2
+import json
 import wandb
+from dataclasses import dataclass
 
 def create_n_array(gpu_utils):
   per_gpu_util = []
@@ -13,18 +12,6 @@ def create_n_array(gpu_utils):
       temp_arr.append(gpu_utils[j][i])
     per_gpu_util.append(temp_arr)
   return per_gpu_util
-
-def plot_graph(value, title, xlabel, ylabel, filename, world_size, output_dir):
-  plt.figure()
-  plt.plot(value)
-  plt.title(title)
-  plt.xlabel(xlabel)
-  plt.ylabel(ylabel)
-  folder = f"{output_dir}/plots_GPU_{world_size}"
-  os.makedirs(folder, exist_ok=True)
-  plot_path = f"{folder}/{filename}"
-  plt.savefig(plot_path)
-  plt.close()
 
 def log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir):
   per_gpu_utils = create_n_array(gpu_utilizations)
@@ -40,77 +27,36 @@ def log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_
       wandb.summary[f"avg_gpu_util_GPU_{i}"] = avg_util
   wandb.finish()
 
+@dataclass
+class DatasetConfig:
+  dataset_name: str
+  task_type: str
+  columns: list[str]
+  max_length: int | None = None
+
+@dataclass
+class TrainingConfig:
+  job_id: str
+  model_name: str
+  job_type: str
+  dataset_config: DatasetConfig
+  epochs: int = 10
+  gpu_count: int = 1
+  batch_size: int = 8
+  accumulation_steps: int = 1
+  hf_repo_id: str = ""
+  dataloader_workers: int = 4
+
+def parse_training_config(value):
+  data = json.loads(value)
+  data['dataset_config'] = DatasetConfig(**data['dataset_config'])
+  return TrainingConfig(**data)
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="PyTorch DDP Training Cluster")
-    parser.add_argument(
-      "--job_id", 
-      type=str,
-      required=True, 
-      help="Id of the job."
-    )
-    parser.add_argument(
-      "--model_name", 
-      type=str,
-      required=True, 
-      help="The specific model architecture to train."
-    )
-    parser.add_argument(
-      "--dataset_name", 
-      type=str, 
-      required=True, 
-      help="The dataset name for training or tuning"
-    )
-    parser.add_argument(
-      "--job_type", 
-      type=str, 
-      required=True, 
-      choices=['train', 'tune'],
-      help="Training or tuning"
-    )
-    parser.add_argument(
-      "--epochs", 
-      type=int, 
-      default=10, 
-      help="Number of epochs to train."
-    )
-    parser.add_argument(
-      "--text_column_name", 
-      type=str, 
-      required=True, 
-      help="text column name of dataset"
-    )
-    parser.add_argument(
-      "--gpu_count", 
-      type=int, 
-      default=1,
-      help="Number of gpu used"
-    )
-    parser.add_argument(
-      "--task_type", 
-      type=str, 
-      default='',
-      help="finetuning model type"
-    )
-    parser.add_argument(
-      "--batch_size", 
-      type=int,
-      help="batchsize for training"
-    )
-    parser.add_argument(
-      "--accumulation_steps", 
-      type=int,
-      default=1,
-      help="accumulation steps for training"
-    )
-    parser.add_argument(
-      "--hf_repo_id", 
-      type=str,
-      help="hugging face model repo"
-    )
-    parser.add_argument(
-      "--dataloader_workers", 
-      type=int,
-      default=1,
-      help="workers for dataloader"
-    )
-    return parser.parse_args()
+  parser = argparse.ArgumentParser(description="PyTorch DDP Training Cluster")
+  parser.add_argument(
+    "--training_config",
+    type=parse_training_config,
+    required=True
+  )
+  return parser.parse_args()

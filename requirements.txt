@@ -6,14 +6,11 @@ datasets>=2.16.0
 accelerate==0.29.0
 peft==0.10.0
 nvidia-ml-py>=12.0.0
-matplotlib==3.8.4
-opencv-python-headless==4.10.0.84
 
 # RunPod
 runpod==1.6.2
 
 # Monitoring & utilities
-tqdm==4.66.2
 numpy==1.26.4
 
 # HuggingFace auth

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 import time
 import pynvml
 from helper import log_final_metrics, parse_args
-from constants import TUNE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE
+from constants import TUNE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE, CASUAL_LM, SFT, CHAT
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
@@ -66,8 +66,6 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
   if rank == 0:
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(f'{output_dir}/plots_GPU_{world_size}', exist_ok=True)
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb.login(key=wandb_api_key)
     wandb.init(
@@ -85,6 +83,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
       }
     )
   global_step = 0
+  amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
   for epoch in range(epochs):
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers)
     i = 0
@@ -100,7 +99,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
         torch.cuda.synchronize()
         starter.record()
       if (i + 1) % accumulation_steps == 0:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
           outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -113,7 +112,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
         optimizer.zero_grad(set_to_none=True)
       else:
         with model.no_sync():
-          with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+          with torch.autocast(device_type="cuda", dtype=amp_dtype):
             outputs = model(
               input_ids=input_ids,
               attention_mask=attention_mask,
@@ -144,7 +143,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
           for j, util in enumerate(utils):
             wandb.log({f"gpu_util_rank_{j}": util})
       if rank == 0:
-        wandb.log({"loss_per_step": reduced_loss})
+        wandb.log({"loss_per_step": reduced_loss.item()})
       i += 1
       global_step += 1
     remaining_steps = i % accumulation_steps
@@ -160,25 +159,76 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
   else:
     return None, None
   
-def preprocess_dataset(dataset, tokenizer, text_column: str):
+def get_tokens(tokenizer, input, isTruncate, max_length, padding):
+  return tokenizer(
+    input,
+    truncation=isTruncate,
+    max_length=max_length,
+    padding=padding,
+  )
+  
+def preprocess_dataset(dataset, tokenizer, columns, task_type, max_length):
   def tokenize(batch):
-      tokens = tokenizer(
-          batch[text_column],
-          truncation=True,
-          max_length=512,
-          padding="max_length",
-      )
+    if task_type == CASUAL_LM:
+      tokens = get_tokens(tokenizer, batch[columns[0]], True, max_length if max_length else tokenizer.model_max_length, "max_length")
       labels = tokens["input_ids"].copy()
       tokens["labels"] = [
         [-100 if t == tokenizer.pad_token_id else t for t in label]
         for label in labels
       ]
       return tokens
+    elif task_type == SFT:
+      full_text = f"""
+        ### Instruction:
+        {batch[columns[0]]}
+
+        ### Response:
+        {batch[columns[1]]}
+      """
+      tokens = get_tokens(tokenizer, full_text, True, max_length if max_length else tokenizer.model_max_length, "max_length")
+      input_ids = tokens["input_ids"]
+      labels = input_ids.copy()
+      prompt_text = f"""
+        ### Instruction:
+        {batch[columns[0]]}
+
+        ### Response:
+      """
+      prompt_tokens =  tokenizer(
+        prompt_text,
+        truncation=True,
+        max_length=max_length if max_length else tokenizer.model_max_length,
+        add_special_tokens=False
+      )["input_ids"]
+      prompt_len = len(prompt_tokens)
+      labels[:prompt_len] = [-100] * prompt_len
+      labels = [
+        -100 if token == tokenizer.pad_token_id else token
+        for token in labels
+      ]
+      tokens["labels"] = labels
+      return tokens
+    elif task_type == CHAT:
+      text = tokenizer.apply_chat_template(
+        batch[columns[0]],
+        tokenize=False
+      )
+      tokens = get_tokens(tokenizer, text, True, max_length if max_length else tokenizer.model_max_length, "max_length")
+      labels = tokens["input_ids"].copy()
+      labels = [
+        -100 if token == tokenizer.pad_token_id else token
+        for token in labels
+      ]
+      tokens["labels"] = labels
+      return tokens
   original_columns = dataset.column_names
-  dataset = dataset.with_format("torch")
-  return dataset.map(tokenize, batched=True, remove_columns=original_columns)
+  if task_type == CASUAL_LM:
+    dataset = dataset.map(tokenize, batched=True, remove_columns=original_columns)
+  elif task_type == SFT or task_type == CHAT:
+    dataset = dataset.map(tokenize, batched=False, remove_columns=original_columns)
+  return dataset.with_format("torch")
   
-def load_model_struct_dataset(model_name, dataset_name, text_column, job_type, task_type):
+def load_model_struct_dataset(model_name, dataset_name, columns, job_type, task_type, max_length):
   if job_type == TUNE:
     model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
     from peft import get_peft_model, LoraConfig, TaskType
@@ -215,7 +265,7 @@ def load_model_struct_dataset(model_name, dataset_name, text_column, job_type, t
   if tokenizer.pad_token is None:
       tokenizer.pad_token = tokenizer.eos_token
       
-  dataset = preprocess_dataset(dataset, tokenizer, text_column)
+  dataset = preprocess_dataset(dataset, tokenizer, columns, task_type, max_length)
   return model, dataset
 
 def main(model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers):
@@ -246,6 +296,7 @@ def main(model, dataset, epochs, output_dir, job_id, model_name, dataset_name, j
 
 if __name__ == '__main__':
   args = parse_args()
+  args = args.config
   output_dir = f"/runpod-volume/{args.job_id}"
-  model, dataset = load_model_struct_dataset(args.model_name, args.dataset_name, args.text_column_name, args.job_type, args.task_type)
-  main(model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers)
+  model, dataset = load_model_struct_dataset(args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
+  main(model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers)

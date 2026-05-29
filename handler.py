@@ -1,32 +1,19 @@
 import runpod
 import subprocess
+import json
 
 def handler(job):
     job_input = job["input"]
     
-    job_id = job_input.get('job_id')
-    model_name = job_input.get('model_name')
-    dataset_name = job_input.get('dataset_name')
-    job_type = job_input.get('job_type')
-    epochs = job_input.get('epochs', 10)
-    text_column_name = job_input.get('text_column_name')
-    gpu_count = job_input.get('gpu_count', 1)
-    task_type = job_input.get('task_type')
+    training_config = job_input.get('training_config')
 
-    print(f"[RunPod Worker] Launching DDP Cluster across {gpu_count} GPUs...")
+    print(f"[RunPod Worker] Launching DDP Cluster across {training_config['gpu_count']} GPUs...")
 
     cmd = [
         "torchrun",
-        f"--nproc_per_node={gpu_count}",
+        f"--nproc_per_node={training_config['gpu_count']}",
         "multi_gpu_training.py",
-        "--model_name", str(model_name),
-        "--dataset_name", str(dataset_name),
-        "--job_type", str(job_type),
-        "--epochs", str(epochs),
-        "--text_column_name", str(text_column_name),
-        "--job_id", str(job_id),
-        "--gpu_count", str(gpu_count),
-        "--task_type", str(task_type)
+        '--config', json.dumps(training_config)
     ]
     
     try:
@@ -34,7 +21,7 @@ def handler(job):
         
         return {
             "status": "COMPLETED",
-            "message": f"Successfully completed training job for {model_name} with job id: {job_id}",
+            "message": f"Successfully completed training job for {training_config['model_name']} with job id: {training_config['job_id']}",
             "logs": result.stdout
         }
         

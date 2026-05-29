@@ -1,3 +1,6 @@
 TUNE = 'tune'
 DATA_LOADER_SEED = 42
 DATA_LOADER_BUFFER_SIZE = 10_000
+CASUAL_LM = 'casual_lm'
+SFT = 'sft'
+CHAT = 'chat'
