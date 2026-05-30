@@ -13,7 +13,7 @@ def handler(job):
         "torchrun",
         f"--nproc_per_node={training_config['gpu_count']}",
         "multi_gpu_training.py",
-        '--config', json.dumps(training_config)
+        '--training_config', json.dumps(training_config)
     ]
     
     try:

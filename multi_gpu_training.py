@@ -14,6 +14,9 @@ from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 import wandb
 from huggingface_hub import HfApi
+from torch.profiler import profile, ProfilerActivity, schedule
+from dotenv import load_dotenv
+load_dotenv()
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -58,6 +61,22 @@ def get_gpu_util(gpu_number) -> int:
   util = pynvml.nvmlDeviceGetUtilizationRates(handle)
   return util.gpu
 
+def get_profiler(output_dir):
+  return profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(
+      wait=1,      # skip first step
+      warmup=1,    # warmup for one step
+      active=3,    # profile 3 steps
+      repeat=2     # do this once
+    ),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler(
+        f'{output_dir}/profiler'
+    ),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=False
+  )
 
 def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers):
   time_per_step = []
@@ -66,7 +85,7 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
   if rank == 0:
-    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_api_key = os.getenv("wabdb_api_key")
     wandb.login(key=wandb_api_key)
     wandb.init(
       project="distrain",
@@ -84,6 +103,9 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
     )
   global_step = 0
   amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+  prof = get_profiler(output_dir) if rank == 0 else None
+  if prof:
+    prof.start()
   for epoch in range(epochs):
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers)
     i = 0
@@ -146,6 +168,8 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
         wandb.log({"loss_per_step": reduced_loss.item()})
       i += 1
       global_step += 1
+      if prof:
+        prof.step()
     remaining_steps = i % accumulation_steps
     if remaining_steps != 0:
       optimizer.step()
@@ -154,6 +178,8 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
       torch.cuda.synchronize()
       time_step = time.time() - epoch_start
       wandb.log({"time_per_epoch": time_step})
+  if prof:
+    prof.stop()
   if rank == 0:
     return time_per_step, gpu_utilizations
   else:
@@ -292,11 +318,17 @@ def main(model, dataset, epochs, output_dir, job_id, model_name, dataset_name, j
       repo_id=hf_repo_id,
       token=os.environ.get("HF_TOKEN")
     )
+    api.upload_folder(
+      folder_path=f'{output_dir}/profiler',
+      repo_id=hf_repo_id,
+      path_in_repo='profiler',
+      token=os.environ.get("HF_TOKEN")
+    )
   dist.destroy_process_group()
 
 if __name__ == '__main__':
   args = parse_args()
-  args = args.config
+  args = args.training_config
   output_dir = f"/runpod-volume/{args.job_id}"
   model, dataset = load_model_struct_dataset(args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
   main(model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers)
