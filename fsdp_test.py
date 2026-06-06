@@ -73,7 +73,6 @@ def main(model_name):
         model,
         auto_wrap_policy=wrap_policy,
         device_id=device,
-        sync_module_states=True,
         sync_module_states=True
     )
     total_params = sum(p.numel() for p in fsdp_model.parameters())
