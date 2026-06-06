@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import os
 os.environ["WANDB_DISABLED"] = "true"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
@@ -8,25 +9,33 @@ from torch.utils.data import DataLoader
 import time
 import pynvml
 from helper import log_final_metrics, parse_args
-from constants import TUNE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE, CASUAL_LM, SFT, CHAT
+from constants import TUNE, DATA_LOADER_SEED, DATA_LOADER_BUFFER_SIZE, CASUAL_LM, SFT, CHAT, ddp, fsdp
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 import wandb
 from huggingface_hub import HfApi
 from torch.profiler import profile, ProfilerActivity, schedule
-from dotenv import load_dotenv
-load_dotenv()
+import importlib
+import functools
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp import (
+  FullStateDictConfig,
+  FullyShardedDataParallel,
+  StateDictType
+)
+from torch.optim.lr_scheduler import LambdaLR
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 """DDP Code"""
 
-def setup_ddp():
+def setup_communication():
   """
   tells that nccl will be used for communication between GPU's
   """
+  os.environ["NCCL_P2P_DISABLE"] = "1"
   dist.init_process_group(
     backend="nccl"
   )
@@ -51,11 +60,6 @@ def get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers):
   )
   return dataloader
 
-def get_model(device, model):
-  model = model.to(device)
-  model = DDP(model, device_ids=[device.index])
-  return model
-
 def get_gpu_util(gpu_number) -> int:
   handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_number)  # GPU 0
   util = pynvml.nvmlDeviceGetUtilizationRates(handle)
@@ -78,29 +82,12 @@ def get_profiler(output_dir):
     with_stack=False
   )
 
-def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers):
+def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler):
   time_per_step = []
   gpu_utilizations = []
   starter = torch.cuda.Event(enable_timing=True)
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
-  if rank == 0:
-    wandb_api_key = os.getenv("wabdb_api_key")
-    wandb.login(key=wandb_api_key)
-    wandb.init(
-      project="distrain",
-      name=job_id,
-      config={
-        "model": model_name,
-        "dataset": dataset_name,
-        "epochs": epochs,
-        "step": 0,
-        "batch_size": batch_size,
-        "accumulation_steps": accumulation_steps,
-        "gpu_count": world_size,
-        "job_type": job_type,
-      }
-    )
   global_step = 0
   amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
   prof = get_profiler(output_dir) if rank == 0 else None
@@ -130,10 +117,13 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
         raw_loss = outputs.loss
         loss = raw_loss / accumulation_steps
         loss.backward()   # all-reduce happens here
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad(set_to_none=True)
       else:
-        with model.no_sync():
+        ctx = model.no_sync() if training_type == ddp  else nullcontext()
+        with ctx:
           with torch.autocast(device_type="cuda", dtype=amp_dtype):
             outputs = model(
               input_ids=input_ids,
@@ -172,8 +162,10 @@ def train(model, dataset, accumulation_steps, device, world_size, epochs, batch_
         prof.step()
     remaining_steps = i % accumulation_steps
     if remaining_steps != 0:
+      torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
       optimizer.step()
       optimizer.zero_grad(set_to_none=True)
+      scheduler.step()
     if rank == 0:
       torch.cuda.synchronize()
       time_step = time.time() - epoch_start
@@ -254,30 +246,13 @@ def preprocess_dataset(dataset, tokenizer, columns, task_type, max_length):
     dataset = dataset.map(tokenize, batched=False, remove_columns=original_columns)
   return dataset.with_format("torch")
   
-def load_model_struct_dataset(model_name, dataset_name, columns, job_type, task_type, max_length):
-  if job_type == TUNE:
-    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
-    from peft import get_peft_model, LoraConfig, TaskType
-    from peft.utils import get_linear_names
-    TASK_TYPE_MAP = {
-      "causal_lm": TaskType.CAUSAL_LM,
-      "seq2seq_lm": TaskType.SEQ_2_SEQ_LM,
-      "image_classification": TaskType.IMAGE_CLASSIFICATION,
-      "token_cls": TaskType.TOKEN_CLS,
-      "seq_cls": TaskType.SEQ_CLS,
-    }
-    task_type_enum = TASK_TYPE_MAP.get(task_type, TaskType.CAUSAL_LM)
-    lora_config = LoraConfig(
-      task_type=task_type_enum,
-      r=16,
-      lora_alpha=32,
-      lora_dropout=0.1,
-      target_modules=get_linear_names(model),
-    )
-    model = get_peft_model(model, lora_config)
-  else:
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+def load_model_struct_dataset(training_type, model_name, dataset_name, columns, job_type, task_type, max_length):
+  config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+  if training_type == ddp:
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+  else:
+    with torch.device("meta"):
+      model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
   dataset = load_dataset(
     dataset_name,
     streaming=True,
@@ -294,24 +269,86 @@ def load_model_struct_dataset(model_name, dataset_name, columns, job_type, task_
   dataset = preprocess_dataset(dataset, tokenizer, columns, task_type, max_length)
   return model, dataset
 
-def main(model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers):
-  setup_ddp()
+def get_wrap_policy(model):
+  if not hasattr(model, "_no_split_modules"):
+    raise ValueError(
+      f"{model.__class__.__name__} does not define _no_split_modules"
+    )
+
+  layer_classes = set()
+
+  module = importlib.import_module(model.__class__.__module__)
+
+  for layer_name in model._no_split_modules:
+    layer_classes.add(
+      getattr(module, layer_name)
+    )
+
+  return functools.partial(
+    transformer_auto_wrap_policy,
+    transformer_layer_cls=layer_classes,
+  )
+
+def get_scheduler(optimizer, warmup_steps, max_steps):
+  def lr_lambda(step):
+      if step < warmup_steps:
+          return step / warmup_steps  # linear warmup
+      return max(0.0, (max_steps - step) / (max_steps - warmup_steps))  # linear decay
+  return LambdaLR(optimizer, lr_lambda)
+
+def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps):
+  setup_communication()
   pynvml.nvmlInit()
   world_size = dist.get_world_size()
   batch_size= batch_size
   accumulation_steps = accumulation_steps
   device = get_device()
-  model = get_model(device, model)
+  if training_type == ddp:
+    model = model.to(device)
+    model = DDP(model, device_ids=[device.index])
+  elif training_type == fsdp:
+    model = FullyShardedDataParallel(
+      model,
+      auto_wrap_policy=get_wrap_policy(model),
+      device_id=device,
+      sync_module_states=True,
+      param_init_fn=lambda m: m.to_empty(device=device, recurse=False)
+    )
   optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
   model.train()
   training_start_time = time.time()
-  time_per_step, gpu_utilizations = train(model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers)
+  scheduler = get_scheduler(optimizer, warmup_steps=warmup_steps, max_steps=max_steps)
+  if dist.get_rank() == 0:
+    wandb_api_key = os.getenv("wandb_api_key")
+    wandb.login(key=wandb_api_key)
+    wandb.init(
+      project="distrain",
+      name=job_id,
+      config={
+        "model": model_name,
+        "dataset": dataset_name,
+        "epochs": epochs,
+        "step": 0,
+        "batch_size": batch_size,
+        "accumulation_steps": accumulation_steps,
+        "gpu_count": world_size,
+        "job_type": job_type,
+      }
+    )
+  time_per_step, gpu_utilizations = train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler)
   total_time_taken = time.time() - training_start_time
+  if training_type == fsdp:
+    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FullyShardedDataParallel.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+      state_dict = model.state_dict()
   if dist.get_rank() == 0:
     log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir)
     api = HfApi()
     model_dir = f'{output_dir}/model_{dist.get_rank()}_{world_size}.pt'
-    torch.save(model.module.state_dict(), model_dir)
+    if training_type == ddp:
+      torch.save(model.module.state_dict(), model_dir)
+    else:
+      torch.save(state_dict, model_dir)
     api.upload_file(
       path_or_fileobj=model_dir,
       path_in_repo="model_final.pt",
@@ -324,11 +361,38 @@ def main(model, dataset, epochs, output_dir, job_id, model_name, dataset_name, j
       path_in_repo='profiler',
       token=os.environ.get("HF_TOKEN")
     )
+  dist.barrier()
   dist.destroy_process_group()
+  pynvml.nvmlShutdown()
 
 if __name__ == '__main__':
   args = parse_args()
   args = args.training_config
   output_dir = f"/runpod-volume/{args.job_id}"
-  model, dataset = load_model_struct_dataset(args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
-  main(model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers)
+  model, dataset = load_model_struct_dataset(args.training_type, args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
+  main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps)
+
+
+
+#### Finre tuning for Later ##########
+# if job_type == TUNE:
+# model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+# from peft import get_peft_model, LoraConfig, TaskType
+# from peft.utils import get_linear_names
+# TASK_TYPE_MAP = {
+#   "causal_lm": TaskType.CAUSAL_LM,
+#   "seq2seq_lm": TaskType.SEQ_2_SEQ_LM,
+#   "image_classification": TaskType.IMAGE_CLASSIFICATION,
+#   "token_cls": TaskType.TOKEN_CLS,
+#   "seq_cls": TaskType.SEQ_CLS,
+# }
+# task_type_enum = TASK_TYPE_MAP.get(task_type, TaskType.CAUSAL_LM)
+# lora_config = LoraConfig(
+#   task_type=task_type_enum,
+#   r=16,
+#   lora_alpha=32,
+#   lora_dropout=0.1,
+#   target_modules=get_linear_names(model),
+# )
+# model = get_peft_model(model, lora_config)
+# else:

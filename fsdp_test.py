@@ -1,3 +1,4 @@
+import datetime
 import os
 from torch.distributed.fsdp import (
    FullyShardedDataParallel
@@ -15,7 +16,8 @@ def setup_fsdp():
   tells that nccl will be used for communication between GPU's
   """
   dist.init_process_group(
-    backend="nccl"
+    backend="nccl",
+    timeout=datetime.timedelta(seconds=30)
   )
   
 def get_fake_batch(batch_size, seq_len, vocab_size, device):
