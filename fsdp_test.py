@@ -1,6 +1,4 @@
 import os
-os.environ["WANDB_DISABLED"] = "true"
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
 from torch.distributed.fsdp import (
    FullyShardedDataParallel
 )
@@ -56,7 +54,7 @@ def train(model, optimizer, epochs, device):
         if dist.get_rank() == 0:
             utils = [get_gpu_util(j) for j in range(torch.cuda.device_count())]
             for j, util in enumerate(utils):
-                print({f"gpu_util_rank_{j}": util})
+                print({f"gpu_{j}": util})
             print(f"epoch {i} loss {loss.item():.4f}")
 
 def main(model_name):
@@ -64,19 +62,25 @@ def main(model_name):
     pynvml.nvmlInit()
     device = get_device()
     model = GPT2LMHeadModel.from_pretrained(model_name)
-    model.to(device)
     wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={GPT2Block}
     )
+    if dist.get_rank() == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Total model params: {total_params}")
     fsdp_model = FullyShardedDataParallel(
         model,
         auto_wrap_policy=wrap_policy,
+        device_id=device,
+        sync_module_states=True,
+        sync_module_states=True
     )
     total_params = sum(p.numel() for p in fsdp_model.parameters())
     print(f"rank {dist.get_rank()} params: {total_params}")
     optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=2e-4)
     fsdp_model.train()
+    dist.barrier()
     train(fsdp_model, optimizer, 10, device)
     dist.destroy_process_group()
 
