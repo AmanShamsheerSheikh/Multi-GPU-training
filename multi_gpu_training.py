@@ -22,9 +22,13 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import (
   FullStateDictConfig,
   FullyShardedDataParallel,
+  ShardedStateDictConfig,
   StateDictType
 )
 from torch.optim.lr_scheduler import LambdaLR
+import json
+import threading
+from huggingface_hub import hf_hub_download, list_repo_files
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -82,18 +86,106 @@ def get_profiler(output_dir):
     with_stack=False
   )
 
-def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler):
+def upload_to_hf(save_dir, repo_id, index):
+  api = HfApi(token=os.environ.get("HF_TOKEN"))
+  api.upload_folder(
+    folder_path=save_dir,
+    repo_id=repo_id,
+    repo_type="model",
+    path_in_repo=f'checkpoint/slot_{index}',
+    commit_message=f"checkpoint slot {index}"
+  )
+
+def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, global_step, upload_every_n_steps, hf_repo_id):
+  save_dir = f'./checkpoint/slot_{index}/'
+  os.makedirs(save_dir, exist_ok=True)
+  sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+  with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+    sharded_state = model.state_dict()
+    optim_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
+  torch.save(sharded_state, f'{save_dir}/shard_{rank}.pt')
+  torch.save(optim_state, f'{save_dir}/optimizer_{rank}.pt')
+
+  if rank == 0:
+    torch.save(scheduler.state_dict(), f'{save_dir}/scheduler.pt')
+    data = {
+      'loss': loss,
+      'global_step': global_step,
+      'epoch': epoch
+    }
+    with open(f"{save_dir}/meta.json", "w") as f:
+      json.dump(data, f, indent=4)
+  dist.barrier()
+  if global_step % upload_every_n_steps == 0:
+    if rank == 0:
+      thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
+      thread.daemon = True
+      thread.start()
+
+
+def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id):
+  hf_token = os.environ.get("HF_TOKEN")
+  try:
+    files = list(list_repo_files(repo_id, token=hf_token))
+  except Exception:
+    return None, model, optimizer, scheduler 
+
+  latest_slot = None
+  latest_step = -1
+  for slot in range(2):
+    try:
+      meta_path = hf_hub_download(repo_id, f'checkpoint/slot_{slot}/meta.json', token=hf_token)
+      with open(meta_path) as f:
+        meta = json.load(f)
+      if meta['global_step'] > latest_step:
+        latest_step = meta['global_step']
+        latest_slot = slot
+        latest_meta = meta
+    except Exception:
+      continue
+
+  if latest_slot is None:
+    return None, model, optimizer, scheduler
+ 
+  model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/shard_{rank}.pt', token=hf_token)
+  optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer_{rank}.pt', token=hf_token)
+
+  sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+  with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+    sharded_state = torch.load(model_path, map_location='cpu')
+    model.load_state_dict(sharded_state)
+
+    optim_state = torch.load(optim_path, map_location='cpu')
+    optim_state = FullyShardedDataParallel.optim_state_dict_to_load(model, optimizer, optim_state)
+    optimizer.load_state_dict(optim_state)
+
+  if rank == 0:
+    sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
+    scheduler_state = torch.load(sched_path, map_location='cpu')
+  else:
+    scheduler_state = None
+  scheduler_state_list = [scheduler_state]
+  dist.broadcast_object_list(scheduler_state_list, src=0)
+  scheduler.load_state_dict(scheduler_state_list[0])
+  dist.barrier()
+  return latest_meta, model, optimizer, scheduler 
+
+def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, meta):
   time_per_step = []
   gpu_utilizations = []
   starter = torch.cuda.Event(enable_timing=True)
   ender = torch.cuda.Event(enable_timing=True)
   rank = dist.get_rank()
-  global_step = 0
   amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
   prof = get_profiler(output_dir) if rank == 0 else None
+  start_epoch = 0
+  if meta is not None:
+    start_epoch = meta['epoch']
+  global_step = meta['global_step'] if meta else 0
   if prof:
     prof.start()
-  for epoch in range(epochs):
+  index_to_save = 0
+  for epoch in range(start_epoch, epochs):
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers)
     i = 0
     if rank == 0:
@@ -104,9 +196,11 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
       input_ids = batch["input_ids"].to(device, non_blocking=True)
       attention_mask = batch["attention_mask"].to(device, non_blocking=True)
       labels = batch["labels"].to(device, non_blocking=True)
+
       if rank == 0:
         torch.cuda.synchronize()
         starter.record()
+
       if (i + 1) % accumulation_steps == 0:
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
           outputs = model(
@@ -117,7 +211,7 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
         raw_loss = outputs.loss
         loss = raw_loss / accumulation_steps
         loss.backward()   # all-reduce happens here
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        model.clip_grad_norm_(1.0)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
@@ -157,15 +251,19 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
       if rank == 0:
         wandb.log({"loss_per_step": reduced_loss.item()})
       i += 1
+
       global_step += 1
+      if global_step % save_every_n_steps == 0:
+        save_checkpoint(model, optimizer, scheduler, rank, index_to_save, reduced_loss.item(), epoch, global_step, upload_every_n_steps, hf_repo_id)
+        index_to_save = 0 if index_to_save == 1 else 1
+
       if prof:
         prof.step()
     remaining_steps = i % accumulation_steps
     if remaining_steps != 0:
-      torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+      model.clip_grad_norm_(1.0)
       optimizer.step()
       optimizer.zero_grad(set_to_none=True)
-      scheduler.step()
     if rank == 0:
       torch.cuda.synchronize()
       time_step = time.time() - epoch_start
@@ -264,7 +362,7 @@ def load_model_struct_dataset(training_type, model_name, dataset_name, columns, 
   tokenizer = AutoTokenizer.from_pretrained(model_name)
   
   if tokenizer.pad_token is None:
-      tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token = tokenizer.eos_token
       
   dataset = preprocess_dataset(dataset, tokenizer, columns, task_type, max_length)
   return model, dataset
@@ -296,7 +394,7 @@ def get_scheduler(optimizer, warmup_steps, max_steps):
       return max(0.0, (max_steps - step) / (max_steps - warmup_steps))  # linear decay
   return LambdaLR(optimizer, lr_lambda)
 
-def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps):
+def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps, save_every_n_steps, upload_every_n_steps):
   setup_communication()
   pynvml.nvmlInit()
   world_size = dist.get_world_size()
@@ -315,9 +413,10 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
       param_init_fn=lambda m: m.to_empty(device=device, recurse=False)
     )
   optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
+  scheduler = get_scheduler(optimizer, warmup_steps=warmup_steps, max_steps=max_steps)
+  meta, model, optimizer, scheduler = load_checkpoint(model,optimizer, scheduler, dist.get_rank(), device, hf_repo_id)
   model.train()
   training_start_time = time.time()
-  scheduler = get_scheduler(optimizer, warmup_steps=warmup_steps, max_steps=max_steps)
   if dist.get_rank() == 0:
     wandb_api_key = os.getenv("wandb_api_key")
     wandb.login(key=wandb_api_key)
@@ -335,7 +434,7 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
         "job_type": job_type,
       }
     )
-  time_per_step, gpu_utilizations = train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler)
+  time_per_step, gpu_utilizations = train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, meta)
   total_time_taken = time.time() - training_start_time
   if training_type == fsdp:
     cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -370,7 +469,7 @@ if __name__ == '__main__':
   args = args.training_config
   output_dir = f"/runpod-volume/{args.job_id}"
   model, dataset = load_model_struct_dataset(args.training_type, args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
-  main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps)
+  main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps, args.save_every_n_steps, args.upload_every_n_steps)
 
 
 

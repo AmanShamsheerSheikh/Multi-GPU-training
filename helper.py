@@ -49,6 +49,8 @@ class TrainingConfig:
   training_type: str
   max_steps: int
   warmup_steps: int
+  save_every_n_steps: int
+  upload_every_n_steps: int
 
 def parse_training_config(value):
   data = json.loads(value)
