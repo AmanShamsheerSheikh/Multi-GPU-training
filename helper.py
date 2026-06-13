@@ -36,6 +36,11 @@ class DatasetConfig:
 
 @dataclass
 class TrainingConfig:
+  training_type: str
+  max_steps: int
+  warmup_steps: int
+  save_every_n_steps: int
+  upload_every_n_steps: int
   job_id: str
   model_name: str
   job_type: str
@@ -46,11 +51,6 @@ class TrainingConfig:
   accumulation_steps: int = 1
   hf_repo_id: str = ""
   dataloader_workers: int = 4
-  training_type: str
-  max_steps: int
-  warmup_steps: int
-  save_every_n_steps: int
-  upload_every_n_steps: int
 
 def parse_training_config(value):
   data = json.loads(value)

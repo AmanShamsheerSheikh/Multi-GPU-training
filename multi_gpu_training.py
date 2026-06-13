@@ -70,6 +70,8 @@ def get_gpu_util(gpu_number) -> int:
   return util.gpu
 
 def get_profiler(output_dir):
+  profiler_dir = f'{output_dir}/profiler'
+  os.makedirs(profiler_dir, exist_ok=True)
   return profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     schedule=schedule(
@@ -79,7 +81,7 @@ def get_profiler(output_dir):
       repeat=2     # do this once
     ),
     on_trace_ready=torch.profiler.tensorboard_trace_handler(
-        f'{output_dir}/profiler'
+      profiler_dir
     ),
     record_shapes=True,
     profile_memory=True,
@@ -87,14 +89,17 @@ def get_profiler(output_dir):
   )
 
 def upload_to_hf(save_dir, repo_id, index):
-  api = HfApi(token=os.environ.get("HF_TOKEN"))
-  api.upload_folder(
-    folder_path=save_dir,
-    repo_id=repo_id,
-    repo_type="model",
-    path_in_repo=f'checkpoint/slot_{index}',
-    commit_message=f"checkpoint slot {index}"
-  )
+  try:
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    api.upload_folder(
+      folder_path=save_dir,
+      repo_id=repo_id,
+      repo_type="model",
+      path_in_repo=f'checkpoint/slot_{index}',
+      commit_message=f"checkpoint slot {index}"
+    )
+  except Exception as e:
+    print("Error :", e)
 
 def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, global_step, upload_every_n_steps, hf_repo_id, training_type):
   save_dir = f'./checkpoint/slot_{index}/'
@@ -124,7 +129,7 @@ def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, globa
         thread.start()
   else:
     if rank == 0:
-      torch.save(model.state_dict(), f'{save_dir}/model.pt')
+      torch.save(model.module.state_dict(), f'{save_dir}/model.pt')
       torch.save(optimizer.state_dict(), f'{save_dir}/optimizer.pt')
       torch.save(scheduler.state_dict(), f'{save_dir}/scheduler.pt')
       data = {
@@ -187,30 +192,21 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
     dist.barrier()
     return latest_meta, model, optimizer, scheduler
   else:
-    if rank == 0:
-      model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/model.pt', token=hf_token)
-      optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer.pt', token=hf_token)
-      sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
-      model_state = torch.load(model_path, map_location='cpu')
-      optim_state = torch.load(optim_path, map_location='cpu')
-      scheduler_state = torch.load(sched_path, map_location='cpu')
-    else:
-      model_state = None
-      scheduler_state = None
-      optim_state = None
+    # All ranks download independently and simultaneously
+    model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/model.pt', token=hf_token)
+    optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer.pt', token=hf_token)
+    sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
 
-    model_state_list = [model_state]
-    dist.broadcast_object_list(model_state_list, src=0)
-    model.load_state_dict(model_state_list[0])
+    model_state = torch.load(model_path, map_location='cpu')
+    model.load_state_dict(model_state)
 
-    optimizer_state_list = [optim_state]
-    dist.broadcast_object_list(optimizer_state_list, src=0)
-    optimizer.load_state_dict(optimizer_state_list[0])
+    optim_state = torch.load(optim_path, map_location='cpu')
+    optimizer.load_state_dict(optim_state)
 
+    scheduler_state = torch.load(sched_path, map_location='cpu')
+    scheduler.load_state_dict(scheduler_state)
 
-    scheduler_state_list = [scheduler_state]
-    dist.broadcast_object_list(scheduler_state_list, src=0)
-    scheduler.load_state_dict(scheduler_state_list[0])
+    dist.barrier()
     return latest_meta, model, optimizer, scheduler
 
 
@@ -255,7 +251,10 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
         raw_loss = outputs.loss
         loss = raw_loss / accumulation_steps
         loss.backward()   # all-reduce happens here
-        model.clip_grad_norm_(1.0)
+        if training_type == fsdp:
+          model.clip_grad_norm_(1.0)
+        else:
+          torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
@@ -305,8 +304,12 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
         prof.step()
     remaining_steps = i % accumulation_steps
     if remaining_steps != 0:
-      model.clip_grad_norm_(1.0)
+      if training_type == fsdp:
+        model.clip_grad_norm_(1.0)
+      else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       optimizer.step()
+      scheduler.step() 
       optimizer.zero_grad(set_to_none=True)
     if rank == 0:
       torch.cuda.synchronize()
@@ -484,26 +487,46 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
     cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FullyShardedDataParallel.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
       state_dict = model.state_dict()
+      optim_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
   if dist.get_rank() == 0:
     log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir)
     api = HfApi()
-    model_dir = f'{output_dir}/model_{dist.get_rank()}_{world_size}.pt'
+    model_dir = f'{output_dir}/model_final.pt'
+    optim_dir = f'{output_dir}/optim_final.pt'
+    scheduler_dir = f'{output_dir}/scheduler_final.pt'
     if training_type == ddp:
       torch.save(model.module.state_dict(), model_dir)
+      torch.save(optimizer.state_dict(), optim_dir)
     else:
       torch.save(state_dict, model_dir)
+      torch.save(optim_state, optim_dir)
+    torch.save(scheduler.state_dict(), scheduler_dir)
+      
     api.upload_file(
       path_or_fileobj=model_dir,
       path_in_repo="model_final.pt",
       repo_id=hf_repo_id,
       token=os.environ.get("HF_TOKEN")
     )
-    api.upload_folder(
-      folder_path=f'{output_dir}/profiler',
+    api.upload_file(
+      path_or_fileobj=optim_dir,
+      path_in_repo="optim_final.pt",
       repo_id=hf_repo_id,
-      path_in_repo='profiler',
       token=os.environ.get("HF_TOKEN")
     )
+    api.upload_file(
+      path_or_fileobj=scheduler_dir,
+      path_in_repo="scheduler_final.pt",
+      repo_id=hf_repo_id,
+      token=os.environ.get("HF_TOKEN")
+    )
+    if os.path.exists(f'{output_dir}/profiler'):
+      api.upload_folder(
+        folder_path=f'{output_dir}/profiler',
+        repo_id=hf_repo_id,
+        path_in_repo='profiler',
+        token=os.environ.get("HF_TOKEN")
+      )
   dist.barrier()
   dist.destroy_process_group()
   pynvml.nvmlShutdown()
@@ -511,7 +534,8 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
 if __name__ == '__main__':
   args = parse_args()
   args = args.training_config
-  output_dir = f"/runpod-volume/{args.job_id}"
+  output_dir = f"./data/{args.job_id}"
+  os.makedirs(output_dir, exist_ok=True)
   model, dataset = load_model_struct_dataset(args.training_type, args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
   main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps, args.save_every_n_steps, args.upload_every_n_steps)
 
