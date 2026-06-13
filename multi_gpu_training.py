@@ -96,34 +96,50 @@ def upload_to_hf(save_dir, repo_id, index):
     commit_message=f"checkpoint slot {index}"
   )
 
-def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, global_step, upload_every_n_steps, hf_repo_id):
+def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, global_step, upload_every_n_steps, hf_repo_id, training_type):
   save_dir = f'./checkpoint/slot_{index}/'
   os.makedirs(save_dir, exist_ok=True)
-  sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-  with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
-    sharded_state = model.state_dict()
-    optim_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
-  torch.save(sharded_state, f'{save_dir}/shard_{rank}.pt')
-  torch.save(optim_state, f'{save_dir}/optimizer_{rank}.pt')
+  if training_type == fsdp:
+    sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+    with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+      sharded_state = model.state_dict()
+      optim_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
+    torch.save(sharded_state, f'{save_dir}/shard_{rank}.pt')
+    torch.save(optim_state, f'{save_dir}/optimizer_{rank}.pt')
 
-  if rank == 0:
-    torch.save(scheduler.state_dict(), f'{save_dir}/scheduler.pt')
-    data = {
-      'loss': loss,
-      'global_step': global_step,
-      'epoch': epoch
-    }
-    with open(f"{save_dir}/meta.json", "w") as f:
-      json.dump(data, f, indent=4)
-  dist.barrier()
-  if global_step % upload_every_n_steps == 0:
     if rank == 0:
-      thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
-      thread.daemon = True
-      thread.start()
+      torch.save(scheduler.state_dict(), f'{save_dir}/scheduler.pt')
+      data = {
+        'loss': loss,
+        'global_step': global_step,
+        'epoch': epoch
+      }
+      with open(f"{save_dir}/meta.json", "w") as f:
+        json.dump(data, f, indent=4)
+    dist.barrier()
+    if global_step % upload_every_n_steps == 0:
+      if rank == 0:
+        thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
+        thread.daemon = True
+        thread.start()
+  else:
+    if rank == 0:
+      torch.save(model.state_dict(), f'{save_dir}/model.pt')
+      torch.save(optimizer.state_dict(), f'{save_dir}/optimizer.pt')
+      torch.save(scheduler.state_dict(), f'{save_dir}/scheduler.pt')
+      data = {
+        'loss': loss,
+        'global_step': global_step,
+        'epoch': epoch
+      }
+      with open(f"{save_dir}/meta.json", "w") as f:
+        json.dump(data, f, indent=4)
+      if global_step % upload_every_n_steps == 0:
+        thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
+        thread.daemon = True
+        thread.start()
 
-
-def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id):
+def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training_type):
   hf_token = os.environ.get("HF_TOKEN")
   try:
     files = list(list_repo_files(repo_id, token=hf_token))
@@ -146,29 +162,57 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id):
 
   if latest_slot is None:
     return None, model, optimizer, scheduler
- 
-  model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/shard_{rank}.pt', token=hf_token)
-  optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer_{rank}.pt', token=hf_token)
+  if training_type == fsdp:
+  
+    model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/shard_{rank}.pt', token=hf_token)
+    optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer_{rank}.pt', token=hf_token)
 
-  sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-  with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
-    sharded_state = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(sharded_state)
+    sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+    with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+      sharded_state = torch.load(model_path, map_location='cpu', mmap=True)
+      model.load_state_dict(sharded_state)
 
-    optim_state = torch.load(optim_path, map_location='cpu')
-    optim_state = FullyShardedDataParallel.optim_state_dict_to_load(model, optimizer, optim_state)
-    optimizer.load_state_dict(optim_state)
+      optim_state = torch.load(optim_path, map_location='cpu', mmap=True)
+      optim_state = FullyShardedDataParallel.optim_state_dict_to_load(model, optimizer, optim_state)
+      optimizer.load_state_dict(optim_state)
 
-  if rank == 0:
-    sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
-    scheduler_state = torch.load(sched_path, map_location='cpu')
+    if rank == 0:
+      sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
+      scheduler_state = torch.load(sched_path, map_location='cpu', mmap=True)
+    else:
+      scheduler_state = None
+    scheduler_state_list = [scheduler_state]
+    dist.broadcast_object_list(scheduler_state_list, src=0)
+    scheduler.load_state_dict(scheduler_state_list[0])
+    dist.barrier()
+    return latest_meta, model, optimizer, scheduler
   else:
-    scheduler_state = None
-  scheduler_state_list = [scheduler_state]
-  dist.broadcast_object_list(scheduler_state_list, src=0)
-  scheduler.load_state_dict(scheduler_state_list[0])
-  dist.barrier()
-  return latest_meta, model, optimizer, scheduler 
+    if rank == 0:
+      model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/model.pt', token=hf_token)
+      optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer.pt', token=hf_token)
+      sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
+      model_state = torch.load(model_path, map_location='cpu')
+      optim_state = torch.load(optim_path, map_location='cpu')
+      scheduler_state = torch.load(sched_path, map_location='cpu')
+    else:
+      model_state = None
+      scheduler_state = None
+      optim_state = None
+
+    model_state_list = [model_state]
+    dist.broadcast_object_list(model_state_list, src=0)
+    model.load_state_dict(model_state_list[0])
+
+    optimizer_state_list = [optim_state]
+    dist.broadcast_object_list(optimizer_state_list, src=0)
+    optimizer.load_state_dict(optimizer_state_list[0])
+
+
+    scheduler_state_list = [scheduler_state]
+    dist.broadcast_object_list(scheduler_state_list, src=0)
+    scheduler.load_state_dict(scheduler_state_list[0])
+    return latest_meta, model, optimizer, scheduler
+
 
 def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, meta):
   time_per_step = []
@@ -254,7 +298,7 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
 
       global_step += 1
       if global_step % save_every_n_steps == 0:
-        save_checkpoint(model, optimizer, scheduler, rank, index_to_save, reduced_loss.item(), epoch, global_step, upload_every_n_steps, hf_repo_id)
+        save_checkpoint(model, optimizer, scheduler, rank, index_to_save, reduced_loss.item(), epoch, global_step, upload_every_n_steps, hf_repo_id, training_type)
         index_to_save = 0 if index_to_save == 1 else 1
 
       if prof:
@@ -414,7 +458,7 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
     )
   optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
   scheduler = get_scheduler(optimizer, warmup_steps=warmup_steps, max_steps=max_steps)
-  meta, model, optimizer, scheduler = load_checkpoint(model,optimizer, scheduler, dist.get_rank(), device, hf_repo_id)
+  meta, model, optimizer, scheduler = load_checkpoint(model, optimizer, scheduler, dist.get_rank(), device, hf_repo_id, training_type)
   model.train()
   training_start_time = time.time()
   if dist.get_rank() == 0:
