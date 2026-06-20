@@ -15,18 +15,19 @@ def create_n_array(gpu_utils):
   return per_gpu_util
 
 def log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir):
+  os.makedirs(f"{output_dir}/logs", exist_ok=True)
   per_gpu_utils = create_n_array(gpu_utilizations)
   avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
   global_batch_size = batch_size * world_size
   effective_batch_size = global_batch_size * accumulation_steps
   throughput = effective_batch_size / avg_step_time_s
-  wandb.summary["throughput"] = throughput
-  wandb.summary["total_time_taken"] = total_time_taken
-  wandb.summary["avg_step_time"] = avg_step_time_s
-  for i in range(len(per_gpu_utils)):
+  with open(f"{output_dir}/logs/training_metadata.txt", "w") as f:
+    f.write(f"throughput: {throughput:.2f} samples/sec\n")
+    f.write(f"total_time_taken: {total_time_taken:.2f} sec\n")
+    f.write(f"avg_step_time: {avg_step_time_s:.4f} sec\n")
+    for i in range(len(per_gpu_utils)):
       avg_util = sum(per_gpu_utils[i]) / len(per_gpu_utils[i])
-      wandb.summary[f"avg_gpu_util_GPU_{i}"] = avg_util
-  wandb.finish()
+      f.write(f"avg_gpu_util_GPU_{i}: {avg_util:.2f}%\n")
 
 @dataclass
 class DatasetConfig:

@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import json
 import threading
 from huggingface_hub import hf_hub_download, list_repo_files
+from torch.cuda import memory_allocated, max_memory_allocated, reset_peak_memory_stats
 from dotenv import load_dotenv
 load_dotenv()
 import logging
@@ -242,6 +243,7 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
   if prof:
     prof.start()
   index_to_save = 0
+  is_memory_stats_stored = False
   for epoch in range(start_epoch, epochs):
     logger.info(f"epoch: {epoch}")
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers)
@@ -260,6 +262,9 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
         starter.record()
 
       if (i + 1) % accumulation_steps == 0:
+        if not is_memory_stats_stored:
+          reset_peak_memory_stats()
+          baseline = memory_allocated() / 1024 / 1024
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
           outputs = model(
             input_ids=input_ids,
@@ -268,7 +273,16 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
           )
         raw_loss = outputs.loss
         loss = raw_loss / accumulation_steps
-        loss.backward()   # all-reduce happens here
+        if not is_memory_stats_stored:
+          post_forward = memory_allocated() / 1024 / 1024
+          loss.backward()
+          post_backward = memory_allocated() / 1024 / 1024
+          peak = max_memory_allocated() / 1024 / 1024
+          is_memory_stats_stored = True
+          if rank == 0: 
+            write_model_details(output_dir, baseline, post_forward, post_backward, peak)
+        else:
+          loss.backward()
         if training_type == fsdp:
           model.clip_grad_norm_(1.0)
         else:
@@ -287,7 +301,6 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
             )
           raw_loss = outputs.loss
           loss = raw_loss / accumulation_steps
-          loss.backward()
 
       if rank == 0:
         ender.record()
@@ -458,6 +471,14 @@ def get_scheduler(optimizer, warmup_steps, max_steps):
           return step / warmup_steps  # linear warmup
       return max(0.0, (max_steps - step) / (max_steps - warmup_steps))  # linear decay
   return LambdaLR(optimizer, lr_lambda)
+
+def write_model_details(output_dir, baseline, post_forward, post_backward, peak):
+  os.makedirs(f"{output_dir}/logs", exist_ok=True)
+  with open(f"{output_dir}/logs/memory_stats.txt", "w") as f:
+    f.write(f"Weights + Optimizer: {baseline:.2f} MB\n")
+    f.write(f"Activations: {post_forward - baseline:.2f} MB\n")
+    f.write(f"Gradients: {post_backward - post_forward:.2f} MB\n")
+    f.write(f"Peak Total: {peak:.2f} MB\n")
 
 def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps, save_every_n_steps, upload_every_n_steps):
   logger.info("Main function")
