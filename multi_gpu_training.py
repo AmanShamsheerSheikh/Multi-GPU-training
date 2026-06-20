@@ -29,9 +29,18 @@ from torch.optim.lr_scheduler import LambdaLR
 import json
 import threading
 from huggingface_hub import hf_hub_download, list_repo_files
+from dotenv import load_dotenv
+load_dotenv()
+import logging
+logging.basicConfig(
+  level=logging.INFO,
+  format="[%(asctime)s] [rank %(process)d] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+upload_thread = None
 
 """DDP Code"""
 
@@ -39,7 +48,10 @@ def setup_communication():
   """
   tells that nccl will be used for communication between GPU's
   """
-  os.environ["NCCL_P2P_DISABLE"] = "1"
+  # RunPod-specific workaround: NCCL P2P/CUMEM transport deadlock on SYS-topology
+  # dual-L4 environments. Disable P2P to force fallback to SHM/NET transport.
+  # Remove this if running on NVLink-connected GPUs (A100, H100) — P2P is beneficial there.
+  # os.environ["NCCL_P2P_DISABLE"] = "1"
   dist.init_process_group(
     backend="nccl"
   )
@@ -104,6 +116,7 @@ def upload_to_hf(save_dir, repo_id, index):
 def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, global_step, upload_every_n_steps, hf_repo_id, training_type):
   save_dir = f'./checkpoint/slot_{index}/'
   os.makedirs(save_dir, exist_ok=True)
+  global upload_thread
   if training_type == fsdp:
     sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
     with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
@@ -124,9 +137,9 @@ def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, globa
     dist.barrier()
     if global_step % upload_every_n_steps == 0:
       if rank == 0:
-        thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
-        thread.daemon = True
-        thread.start()
+        upload_thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
+        upload_thread.daemon = True
+        upload_thread.start()
   else:
     if rank == 0:
       torch.save(model.module.state_dict(), f'{save_dir}/model.pt')
@@ -140,15 +153,17 @@ def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, globa
       with open(f"{save_dir}/meta.json", "w") as f:
         json.dump(data, f, indent=4)
       if global_step % upload_every_n_steps == 0:
-        thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
-        thread.daemon = True
-        thread.start()
+        upload_thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
+        upload_thread.daemon = True
+        upload_thread.start()
 
 def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training_type):
+  logger.info("Checking for checkpoint")
   hf_token = os.environ.get("HF_TOKEN")
   try:
     files = list(list_repo_files(repo_id, token=hf_token))
   except Exception:
+    logger.info("No checkpoint found")
     return None, model, optimizer, scheduler 
 
   latest_slot = None
@@ -166,16 +181,17 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
       continue
 
   if latest_slot is None:
+    logger.info("No checkpoint found")
     return None, model, optimizer, scheduler
   if training_type == fsdp:
-  
+    logger.info("Loading checkpoint.")
     model_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/shard_{rank}.pt', token=hf_token)
     optim_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/optimizer_{rank}.pt', token=hf_token)
 
     sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
     with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
       sharded_state = torch.load(model_path, map_location='cpu', mmap=True)
-      model.load_state_dict(sharded_state)
+      model.module.load_state_dict(sharded_state)
 
       optim_state = torch.load(optim_path, map_location='cpu', mmap=True)
       optim_state = FullyShardedDataParallel.optim_state_dict_to_load(model, optimizer, optim_state)
@@ -190,6 +206,7 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
     dist.broadcast_object_list(scheduler_state_list, src=0)
     scheduler.load_state_dict(scheduler_state_list[0])
     dist.barrier()
+    logger.info("Checkpoint Loaded")
     return latest_meta, model, optimizer, scheduler
   else:
     # All ranks download independently and simultaneously
@@ -198,7 +215,7 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
     sched_path = hf_hub_download(repo_id, f'checkpoint/slot_{latest_slot}/scheduler.pt', token=hf_token)
 
     model_state = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(model_state)
+    model.module.load_state_dict(model_state)
 
     optim_state = torch.load(optim_path, map_location='cpu')
     optimizer.load_state_dict(optim_state)
@@ -207,10 +224,12 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
     scheduler.load_state_dict(scheduler_state)
 
     dist.barrier()
+    logger.info("Checkpoint Loaded")
     return latest_meta, model, optimizer, scheduler
 
 
 def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, meta):
+  logger.info("Training started")
   time_per_step = []
   gpu_utilizations = []
   starter = torch.cuda.Event(enable_timing=True)
@@ -219,13 +238,12 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
   amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
   prof = get_profiler(output_dir) if rank == 0 else None
   start_epoch = 0
-  if meta is not None:
-    start_epoch = meta['epoch']
-  global_step = meta['global_step'] if meta else 0
+  global_step = 0
   if prof:
     prof.start()
   index_to_save = 0
   for epoch in range(start_epoch, epochs):
+    logger.info(f"epoch: {epoch}")
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers)
     i = 0
     if rank == 0:
@@ -442,6 +460,7 @@ def get_scheduler(optimizer, warmup_steps, max_steps):
   return LambdaLR(optimizer, lr_lambda)
 
 def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps, save_every_n_steps, upload_every_n_steps):
+  logger.info("Main function")
   setup_communication()
   pynvml.nvmlInit()
   world_size = dist.get_world_size()
@@ -456,7 +475,7 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
       model,
       auto_wrap_policy=get_wrap_policy(model),
       device_id=device,
-      sync_module_states=True,
+      sync_module_states=False,
       param_init_fn=lambda m: m.to_empty(device=device, recurse=False)
     )
   optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
@@ -500,8 +519,7 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
     else:
       torch.save(state_dict, model_dir)
       torch.save(optim_state, optim_dir)
-    torch.save(scheduler.state_dict(), scheduler_dir)
-      
+    torch.save(scheduler.state_dict(), scheduler_dir) 
     api.upload_file(
       path_or_fileobj=model_dir,
       path_in_repo="model_final.pt",
@@ -527,6 +545,8 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
         path_in_repo='profiler',
         token=os.environ.get("HF_TOKEN")
       )
+  if dist.get_rank() == 0 and upload_thread:
+    upload_thread.join()
   dist.barrier()
   dist.destroy_process_group()
   pynvml.nvmlShutdown()
@@ -538,28 +558,3 @@ if __name__ == '__main__':
   os.makedirs(output_dir, exist_ok=True)
   model, dataset = load_model_struct_dataset(args.training_type, args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
   main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps, args.save_every_n_steps, args.upload_every_n_steps)
-
-
-
-#### Finre tuning for Later ##########
-# if job_type == TUNE:
-# model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
-# from peft import get_peft_model, LoraConfig, TaskType
-# from peft.utils import get_linear_names
-# TASK_TYPE_MAP = {
-#   "causal_lm": TaskType.CAUSAL_LM,
-#   "seq2seq_lm": TaskType.SEQ_2_SEQ_LM,
-#   "image_classification": TaskType.IMAGE_CLASSIFICATION,
-#   "token_cls": TaskType.TOKEN_CLS,
-#   "seq_cls": TaskType.SEQ_CLS,
-# }
-# task_type_enum = TASK_TYPE_MAP.get(task_type, TaskType.CAUSAL_LM)
-# lora_config = LoraConfig(
-#   task_type=task_type_enum,
-#   r=16,
-#   lora_alpha=32,
-#   lora_dropout=0.1,
-#   target_modules=get_linear_names(model),
-# )
-# model = get_peft_model(model, lora_config)
-# else:

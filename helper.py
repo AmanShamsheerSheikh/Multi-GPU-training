@@ -2,6 +2,7 @@ import argparse
 import json
 import wandb
 from dataclasses import dataclass
+import os
 
 def create_n_array(gpu_utils):
   per_gpu_util = []
@@ -53,9 +54,20 @@ class TrainingConfig:
   dataloader_workers: int = 4
 
 def parse_training_config(value):
-  data = json.loads(value)
-  data['dataset_config'] = DatasetConfig(**data['dataset_config'])
-  return TrainingConfig(**data)
+    if not os.path.exists(value):
+      raise argparse.ArgumentTypeError(f"Config file not found at: {value}")
+        
+    try:
+      with open(value, 'r') as f:
+        data = json.load(f)
+
+      data['dataset_config'] = DatasetConfig(**data['dataset_config'])
+
+      return TrainingConfig(**data)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"Invalid JSON format in file {value}: {e}")
+    except TypeError as e:
+        raise argparse.ArgumentTypeError(f"JSON schema mismatch with dataclass fields: {e}")
 
 def parse_args():
   parser = argparse.ArgumentParser(description="PyTorch DDP Training Cluster")
