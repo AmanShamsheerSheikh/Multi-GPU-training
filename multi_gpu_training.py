@@ -207,7 +207,7 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
     sharded_cfg = ShardedStateDictConfig(offload_to_cpu=True)
     with FullyShardedDataParallel.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
       sharded_state = torch.load(model_path, map_location='cpu', mmap=True)
-      model.module.load_state_dict(sharded_state)
+      model.load_state_dict(sharded_state)
 
       optim_state = torch.load(optim_path, map_location='cpu', mmap=True)
       optim_state = FullyShardedDataParallel.optim_state_dict_to_load(model, optimizer, optim_state)
