@@ -45,6 +45,7 @@ torch.backends.cudnn.allow_tf32 = True
 upload_thread = None
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed.fsdp")
+from torch.utils.data import DistributedSampler
 
 """DDP Code"""
 
@@ -70,14 +71,25 @@ def get_device():
   return torch.device("cuda", local_rank)
 
 def get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers):
-  sharded = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
-  shuffled = sharded.shuffle(seed=DATA_LOADER_SEED + epoch, buffer_size=DATA_LOADER_BUFFER_SIZE)
-  dataloader = DataLoader(
-    shuffled,
-    batch_size=batch_size,
-    num_workers=num_workers,
-    pin_memory=True
-  )
+  if hasattr(dataset, '__len__'):
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    sampler.set_epoch(epoch)
+    dataloader = DataLoader(
+      dataset,
+      batch_size=batch_size,
+      sampler=sampler,
+      num_workers=num_workers,
+      pin_memory=True
+    )
+  else:
+    sharded = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
+    shuffled = sharded.shuffle(seed=DATA_LOADER_SEED + epoch, buffer_size=DATA_LOADER_BUFFER_SIZE)
+    dataloader = DataLoader(
+      shuffled,
+      batch_size=batch_size,
+      num_workers=num_workers,
+      pin_memory=True
+    )
   return dataloader
 
 def get_gpu_util(gpu_number) -> int:
@@ -445,19 +457,24 @@ def load_model_struct_dataset(training_type, model_name, dataset_name, columns, 
   else:
     with torch.device("meta"):
       model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
-  dataset = load_dataset(
-    dataset_name,
-    streaming=True,
-  )
-  if hasattr(dataset, "keys") and callable(dataset.keys):
-    split_name = 'train' if 'train' in dataset.keys() else list(dataset.keys())[0]
-    dataset = dataset[split_name]
+
+  if os.path.exists(dataset_name):
+    logger.info("Loading from disk")
+    from datasets import load_from_disk
+    dataset = load_from_disk(dataset_name)
+    if hasattr(dataset, "keys") and callable(dataset.keys):
+      split_name = 'train' if 'train' in dataset.keys() else list(dataset.keys())[0]
+      dataset = dataset[split_name]
+    dataset = dataset.select(range(10000))
+  else:
+    dataset = load_dataset(dataset_name, streaming=True)
+    if hasattr(dataset, "keys") and callable(dataset.keys):
+      split_name = 'train' if 'train' in dataset.keys() else list(dataset.keys())[0]
+      dataset = dataset[split_name]
 
   tokenizer = AutoTokenizer.from_pretrained(model_name)
-  
   if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-      
   dataset = preprocess_dataset(dataset, tokenizer, columns, task_type, max_length)
   return model, dataset
 

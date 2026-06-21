@@ -56,13 +56,13 @@ class TrainingConfig:
   model_name: str
   job_type: str
   dataset_config: DatasetConfig
+  peak_theoretical_flops: float
   epochs: int = 10
   gpu_count: int = 1
   batch_size: int = 8
   accumulation_steps: int = 1
   hf_repo_id: str = ""
   dataloader_workers: int = 4
-  peak_theoretical_flops: float
 
 def parse_training_config(value):
     if not os.path.exists(value):
