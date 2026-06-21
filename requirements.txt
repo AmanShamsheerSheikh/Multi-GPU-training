@@ -1,20 +1,16 @@
 # Core training
-torch==2.2.0
-torchvision==0.17.0
-transformers==4.40.0
+torch  # remove version pin, let image version win
+torchvision  # same
+transformers>=4.40.0
 datasets>=2.16.0
-accelerate==0.29.0
-peft==0.10.0
+accelerate>=0.29.0
+peft>=0.10.0
 nvidia-ml-py>=12.0.0
 
 # RunPod
 runpod==1.6.2
 
-# Monitoring & utilities
-numpy==1.26.4
-
-# HuggingFace auth
-huggingface-hub==0.22.2
-
-# logging
+# Monitoring
+numpy>=1.26.0
+huggingface-hub>=0.22.2
 wandb==0.27.0

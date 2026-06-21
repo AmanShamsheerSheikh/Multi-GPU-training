@@ -14,17 +14,26 @@ def create_n_array(gpu_utils):
     per_gpu_util.append(temp_arr)
   return per_gpu_util
 
-def log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir):
+def log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, world_size, output_dir, peak_theoretical_flops, model, seq_length, warump_steps):
   os.makedirs(f"{output_dir}/logs", exist_ok=True)
   per_gpu_utils = create_n_array(gpu_utilizations)
+  time_per_step = time_per_step[warump_steps:]
   avg_step_time_s = sum(time_per_step) / len(time_per_step) / 1000 # divide by 1000 to convert ms to s
   global_batch_size = batch_size * world_size
   effective_batch_size = global_batch_size * accumulation_steps
   throughput = effective_batch_size / avg_step_time_s
+
+  num_params = sum(p.numel() for p in model.parameters())
+  peak_flops = peak_theoretical_flops * world_size  # total across all GPUs
+  flops_per_sample = 6 * num_params * seq_length  # 6 * N * T is standard estimate
+  flops_per_step = flops_per_sample * effective_batch_size
+  mfu = flops_per_step / (avg_step_time_s * peak_flops) * 100
+    
   with open(f"{output_dir}/logs/training_metadata.txt", "w") as f:
     f.write(f"throughput: {throughput:.2f} samples/sec\n")
-    f.write(f"total_time_taken: {total_time_taken:.2f} sec\n")
     f.write(f"avg_step_time: {avg_step_time_s:.4f} sec\n")
+    f.write(f"total_time_taken: {avg_step_time_s * len(time_per_step):.4f} sec\n")
+    f.write(f"mfu: {mfu:.4f}%\n")
     for i in range(len(per_gpu_utils)):
       avg_util = sum(per_gpu_utils[i]) / len(per_gpu_utils[i])
       f.write(f"avg_gpu_util_GPU_{i}: {avg_util:.2f}%\n")
@@ -53,6 +62,7 @@ class TrainingConfig:
   accumulation_steps: int = 1
   hf_repo_id: str = ""
   dataloader_workers: int = 4
+  peak_theoretical_flops: float
 
 def parse_training_config(value):
     if not os.path.exists(value):

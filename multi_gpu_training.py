@@ -30,6 +30,7 @@ import json
 import threading
 from huggingface_hub import hf_hub_download, list_repo_files
 from torch.cuda import memory_allocated, max_memory_allocated, reset_peak_memory_stats
+from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 import logging
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 upload_thread = None
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed.fsdp")
 
 """DDP Code"""
 
@@ -141,7 +144,7 @@ def save_checkpoint(model, optimizer, scheduler, rank, index, loss, epoch, globa
         upload_thread = threading.Thread(target=upload_to_hf, args=(save_dir, hf_repo_id, index))
         upload_thread.daemon = True
         upload_thread.start()
-  else:
+  elif training_type == ddp:
     if rank == 0:
       torch.save(model.module.state_dict(), f'{save_dir}/model.pt')
       torch.save(optimizer.state_dict(), f'{save_dir}/optimizer.pt')
@@ -229,7 +232,7 @@ def load_checkpoint(model, optimizer, scheduler, rank, device, repo_id, training
     return latest_meta, model, optimizer, scheduler
 
 
-def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, meta):
+def train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, max_steps):
   logger.info("Training started")
   time_per_step = []
   gpu_utilizations = []
@@ -244,6 +247,7 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
     prof.start()
   index_to_save = 0
   is_memory_stats_stored = False
+  pbar = tqdm(desc="Training", disable=(rank != 0))
   for epoch in range(start_epoch, epochs):
     logger.info(f"epoch: {epoch}")
     dataloader = get_dataloader(batch_size, dataset, world_size, rank, epoch, num_workers)
@@ -257,7 +261,7 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
       attention_mask = batch["attention_mask"].to(device, non_blocking=True)
       labels = batch["labels"].to(device, non_blocking=True)
 
-      if rank == 0:
+      if rank == 0 and i % accumulation_steps == 0:
         torch.cuda.synchronize()
         starter.record()
 
@@ -290,6 +294,11 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        if rank == 0:
+          ender.record()
+          torch.cuda.synchronize()
+          time_per_step.append(starter.elapsed_time(ender))
+          wandb.log({"time_per_step": starter.elapsed_time(ender)})
       else:
         ctx = model.no_sync() if training_type == ddp  else nullcontext()
         with ctx:
@@ -301,12 +310,7 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
             )
           raw_loss = outputs.loss
           loss = raw_loss / accumulation_steps
-
-      if rank == 0:
-        ender.record()
-        torch.cuda.synchronize()
-        time_per_step.append(starter.elapsed_time(ender))
-        wandb.log({"time_per_step": starter.elapsed_time(ender)})
+        
 
       with torch.no_grad():
         reduced_loss = raw_loss.detach()
@@ -327,12 +331,22 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
       i += 1
 
       global_step += 1
-      if global_step % save_every_n_steps == 0:
-        save_checkpoint(model, optimizer, scheduler, rank, index_to_save, reduced_loss.item(), epoch, global_step, upload_every_n_steps, hf_repo_id, training_type)
-        index_to_save = 0 if index_to_save == 1 else 1
+      if rank == 0:
+        pbar.update(1)
+        pbar.set_postfix({"loss": f"{reduced_loss.item():.4f}", "step": global_step, "epoch": epoch})
+      if training_type == ddp and rank == 0:
+        if global_step % save_every_n_steps == 0:
+          save_checkpoint(model, optimizer, scheduler, rank, index_to_save, reduced_loss.item(), epoch, global_step, upload_every_n_steps, hf_repo_id, training_type)
+          index_to_save = 0 if index_to_save == 1 else 1
+      else:
+        if global_step % save_every_n_steps == 0:
+          save_checkpoint(model, optimizer, scheduler, rank, index_to_save, reduced_loss.item(), epoch, global_step, upload_every_n_steps, hf_repo_id, training_type)
+          index_to_save = 0 if index_to_save == 1 else 1
 
       if prof:
         prof.step()
+      if global_step >= max_steps:
+        break
     remaining_steps = i % accumulation_steps
     if remaining_steps != 0:
       if training_type == fsdp:
@@ -346,6 +360,8 @@ def train(training_type, model, dataset, accumulation_steps, device, world_size,
       torch.cuda.synchronize()
       time_step = time.time() - epoch_start
       wandb.log({"time_per_epoch": time_step})
+    if global_step >= max_steps:
+      break
   if prof:
     prof.stop()
   if rank == 0:
@@ -480,7 +496,7 @@ def write_model_details(output_dir, baseline, post_forward, post_backward, peak)
     f.write(f"Gradients: {post_backward - post_forward:.2f} MB\n")
     f.write(f"Peak Total: {peak:.2f} MB\n")
 
-def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps, save_every_n_steps, upload_every_n_steps):
+def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, dataset_name, job_type, batch_size, accumulation_steps, hf_repo_id, num_workers, max_steps, warmup_steps, save_every_n_steps, upload_every_n_steps, peak_theoretical_flops, seq_length):
   logger.info("Main function")
   setup_communication()
   pynvml.nvmlInit()
@@ -521,7 +537,7 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
         "job_type": job_type,
       }
     )
-  time_per_step, gpu_utilizations = train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, job_id, model_name, dataset_name, job_type, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, meta)
+  time_per_step, gpu_utilizations = train(training_type, model, dataset, accumulation_steps, device, world_size, epochs, batch_size, optimizer, output_dir, num_workers, scheduler, save_every_n_steps, upload_every_n_steps, hf_repo_id, max_steps)
   total_time_taken = time.time() - training_start_time
   if training_type == fsdp:
     cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -529,7 +545,7 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
       state_dict = model.state_dict()
       optim_state = FullyShardedDataParallel.optim_state_dict(model, optimizer)
   if dist.get_rank() == 0:
-    log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, total_time_taken, world_size, output_dir)
+    log_final_metrics(time_per_step, gpu_utilizations, batch_size, accumulation_steps, world_size, output_dir, peak_theoretical_flops, model, seq_length, warmup_steps)
     api = HfApi()
     model_dir = f'{output_dir}/model_final.pt'
     optim_dir = f'{output_dir}/optim_final.pt'
@@ -566,6 +582,13 @@ def main(training_type, model, dataset, epochs, output_dir, job_id, model_name, 
         path_in_repo='profiler',
         token=os.environ.get("HF_TOKEN")
       )
+    if os.path.exists(f'{output_dir}/logs'):
+      api.upload_folder(
+        folder_path=f'{output_dir}/logs',
+        repo_id=hf_repo_id,
+        path_in_repo='logs',
+        token=os.environ.get("HF_TOKEN")
+      )
   if dist.get_rank() == 0 and upload_thread:
     upload_thread.join()
   dist.barrier()
@@ -578,4 +601,4 @@ if __name__ == '__main__':
   output_dir = f"./data/{args.job_id}"
   os.makedirs(output_dir, exist_ok=True)
   model, dataset = load_model_struct_dataset(args.training_type, args.model_name, args.dataset_config.dataset_name, args.dataset_config.columns, args.job_type, args.dataset_config.task_type, args.dataset_config.max_length)
-  main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps, args.save_every_n_steps, args.upload_every_n_steps)
+  main(args.training_type, model, dataset, args.epochs, output_dir, args.job_id, args.model_name, args.dataset_config.dataset_name, args.job_type, args.batch_size, args.accumulation_steps, args.hf_repo_id, args.dataloader_workers, args.max_steps, args.warmup_steps, args.save_every_n_steps, args.upload_every_n_steps, args.peak_theoretical_flops, args.dataset_config.max_length)
