@@ -141,3 +141,120 @@ On a RunPod multi-GPU environment, NCCL initialization succeeded but the first c
 
 **Checkpointing Strategy**
 Mid-training checkpoints use `SHARDED_STATE_DICT` — each rank saves its own shard independently without synchronization overhead. End-of-training consolidation uses `FULL_STATE_DICT` (rank 0 only) for HuggingFace upload. Rotating 2-slot local checkpoint scheme prevents disk exhaustion. Background upload threads prevent blocking training.
+
+## Running on RunPod
+
+### 1. Create a RunPod Instance
+
+Launch a multi-GPU pod using either:
+
+* RunPod PyTorch template (recommended)
+* Custom Docker image built from the provided `Dockerfile`
+
+Verify the GPUs are visible:
+
+```bash
+nvidia-smi
+```
+
+---
+
+### 2. Clone the Repository
+
+```bash
+git clone https://github.com/AmanShamsheerSheikh/Multi-GPU-training.git
+cd Multi-GPU-training
+pip install -r requirements.txt
+```
+
+---
+
+### 3. Configure Environment Variables
+
+Distrain uses:
+
+* Hugging Face Hub for model and checkpoint uploads
+* Weights & Biases (W&B) for experiment tracking
+
+Create a `.env` file:
+
+```env
+HF_TOKEN=your_huggingface_token
+wandb_api_key=your_wandb_api_key
+```
+
+The Hugging Face repository specified in:
+
+```json
+{
+  "hf_repo_id": "username/repository-name"
+}
+```
+
+must already exist and the provided token must have write access.
+
+---
+
+### 4. Create a Training Configuration
+
+Create a `config.json` file:
+
+```json
+{
+  "training_type": "",
+  "max_steps": ,
+  "warmup_steps": ,
+  "save_every_n_steps": ,
+  "upload_every_n_steps": ,
+  "job_id": "experiment-1",
+  "model_name": "",
+  "job_type": "",
+  "dataset_config": {
+    "dataset_name": "",
+    "task_type": "",
+    "columns": [""],
+    "max_length": 
+  },
+  "epochs": ,
+  "gpu_count": ,
+  "batch_size": ,
+  "accumulation_steps": ,
+  "hf_repo_id": "",
+  "dataloader_workers": ,
+  "peak_theoretical_flops": 
+}
+```
+
+---
+
+### 5. Launch Training
+
+```bash
+torchrun \
+  --nproc_per_node=<gpu_count> \
+  multi_gpu_training.py \
+  --training_config config.json
+```
+
+Example:
+
+```bash
+torchrun \
+  --nproc_per_node=4 \
+  multi_gpu_training.py \
+  --training_config config.json
+```
+
+---
+
+### 6. Monitor Training
+
+Training logs include:
+
+* Throughput (samples/sec)
+* Average step time
+* GPU utilization
+* Peak memory usage
+* MFU (Model FLOP Utilization)
+
+Checkpoints are automatically saved according to the configuration and can be used to resume interrupted training runs.
