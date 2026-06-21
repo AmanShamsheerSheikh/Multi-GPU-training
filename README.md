@@ -254,6 +254,7 @@ Training logs include:
 * Throughput (samples/sec)
 * Average step time
 * GPU utilization
+* Peak memory usage
 * MFU (Model FLOP Utilization)
 
 Checkpoints are automatically saved according to the configuration and can be used to resume interrupted training runs.
